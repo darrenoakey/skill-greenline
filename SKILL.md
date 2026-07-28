@@ -21,10 +21,10 @@ from `greenline.toml` (committed at the repo root) and CLI args.
 
 | Command | Action | Exit |
 |---|---|---|
-| `greenline setup [--repo PATH]` | Set the enclosing repo up: write `greenline.toml`, create state dir + gate worktree + `last-green` ref, install the pre-push hook, install `docs/DOCTRINE.md` + `docs/greenline.md`, patch `AGENTS.md`, run doctor. Idempotent. | 0 / 2 |
+| `greenline setup [--repo PATH]` | Set the enclosing repo up: write `greenline.toml`, create state dir + gate worktree + `last-green` ref, install the pre-push hook, install `docs/DOCTRINE.md` + `docs/greenline.md`, patch `AGENTS.md`, commit its own scaffolding on main (under the gate's allow-main authorization — never commit it by hand), run doctor. Idempotent. | 0 / 2 |
 | `greenline worktree NAME [--repo PATH]` | Create branch `gl/NAME` off `last-green` and a worktree at `<worktree_base>/NAME`. Prints the path. | 0 / 1 |
 | `greenline submit [BRANCH] [--repo PATH]` | Run BRANCH (default: current worktree's branch) through the serialized gate. Blocks on the lock; prints the holder every 30s while waiting. | 0 pass / 1 gate-fail / 2 env |
-| `greenline adopt [--repo PATH]` | Gate the CURRENT main tip in place — for commits that reached main outside the gate (legacy workflow, hotfixes). Runs check + deploy + publish on the tip. NEVER resets main: check failure leaves main and prod untouched; deploy failure restores prod to last-green (detached, ref preserved) and prints the prod-behind-main banner. | 0 / 1 / 2 |
+| `greenline adopt [--repo PATH]` | Gate the CURRENT main tip in place — for commits that reached main outside the gate (legacy workflow, hotfixes) AND for bootstrapping a freshly set-up repo that has never been gate-deployed (`deployed` missing/stale even though main == last-green). Runs check + deploy + publish on the tip. NEVER resets main: check failure leaves main and prod untouched; deploy failure restores prod to the best known-good SHA (deployed, then last-green) — or, in true bootstrap with no known-good SHA, skips rollback and prints a loud prod-unknown banner. | 0 / 1 / 2 |
 | `greenline done [--force] [--repo PATH]` | From a merged worktree: verify it merged into `last-green`, then remove the worktree + delete the branch. `--force` to skip verification / dirty check. | 0 / 1 |
 | `greenline deploy-pending [--repo PATH]` | Deploy a gated `main` whose deploy was coalesced away and never picked up (only reachable with `coalesce_deploys = true`, and only if the process that should have deployed died). No-op when nothing is pending. | 0 / 1 |
 | `greenline status [--repo PATH]` | No lock. Show lock holder (+ PID liveness), SHA drift (main / origin / last-green / deployed) with an OK/DRIFT verdict, last 3 journal entries, gate worktree cleanliness, latest log. | 0 |
@@ -53,6 +53,11 @@ ports, one-version-backward-compatible migrations) that make the real gate viabl
 
 - `./run check` — cwd = the worktree being gated. Build + lint + FULL tests vs a
   TEST datastore. Exit code is the verdict. Must run concurrently from multiple worktrees.
+  **HARD-CAPPED at 5 minutes** (`CHECK_TIMEOUT_SECONDS = 300`, no config/CLI override):
+  a longer check is killed (whole process group) and the gate FAILS like red tests.
+  The remedy is never raising the limit — speed the suite up (parallelize with isolated
+  namespaces, prebuilt fixtures, warm per-worktree build caches, fail fast on build/lint
+  before slow suites). Playbook: DOCTRINE.md 'The five-minute check'.
 - `./run deploy` — cwd = the canonical checkout. Rebuild/restart prod (e.g.
   `auto -q restart <svc>`); MUST health-check, exit nonzero on unhealthy, and be idempotent.
 - `./run health` *(optional)* — probe only; if absent, greenline re-runs `deploy` as the probe.
