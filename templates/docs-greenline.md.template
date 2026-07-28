@@ -39,7 +39,11 @@ Under an exclusive lock (other submits queue behind it):
    confirm the canonical checkout is clean and on `{main_branch}`; reconcile
    `{main_branch}`/last-green/origin; reset the gate worktree to the main tip.
 2. **Squash-merge** your branch in the gate worktree. Conflict or empty diff → fail fast.
-3. **Check** — run `{check}` with cwd = the gate worktree. Nonzero → main untouched, your branch preserved, log tail printed.
+3. **Check** — run `{check}` with cwd = the gate worktree, under a hard **5-minute
+   cap**. Nonzero *or* over the cap → main untouched, your branch preserved, log tail
+   printed. A timed-out check is killed (whole process group) and counts as a gate
+   FAIL; the fix is a faster suite, never a longer limit — see docs/DOCTRINE.md,
+   "The five-minute check".
 4. **Advance** — fast-forward the canonical `{main_branch}` to the candidate.
 5. **Deploy** — run `{deploy}` with cwd = the canonical checkout. Nonzero → **automatic rollback**: main resets to the previous commit and `{deploy}` re-runs to restore prod.
 6. **Publish** — push `{main_branch}` to origin (via a one-shot allow-push flag the pre-push hook honours) and advance `last-green`.
@@ -47,7 +51,8 @@ Under an exclusive lock (other submits queue behind it):
 ## The contract (you must implement in `./run`)
 
 - **`{check}`** — cwd = the worktree being gated. Build + lint + FULL tests against a
-  **test** datastore. Exit code is the verdict. Must run concurrently from multiple worktrees.
+  **test** datastore. Exit code is the verdict. Must run concurrently from multiple
+  worktrees, and must complete in **under 5 minutes** (hard cap, no override).
 - **`{deploy}`** — cwd = the canonical checkout. Rebuild/restart prod (e.g.
   `auto -q restart {service}`), **health-check**, exit nonzero on unhealthy, and be
   **idempotent** (rollback re-runs it).

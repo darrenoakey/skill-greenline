@@ -102,6 +102,56 @@ RUN_RECORDER = textwrap.dedent(
 )
 
 
+# A ./run whose check hangs well past any sane cap. It spawns a grandchild and
+# records its pid so a test can prove the whole process group was reaped.
+SLOW_CHECK = textwrap.dedent(
+    """
+    FLAGDIR="$(git rev-parse --git-common-dir)"
+    REC="$FLAGDIR/gl-record.log"
+    echo "$1 $(git rev-parse HEAD) $(pwd)" >> "$REC"
+    if [ "$1" = "check" ]; then
+      sleep 120 &
+      child=$!
+      echo "$child" > "$FLAGDIR/slow-child.pid"
+      wait "$child"
+    fi
+    exit 0
+    """
+)
+
+
+def load_greenline_module():
+    """Import the CLI script as a module (it has no .py suffix).
+
+    Lets a test patch module constants and call main() in-process — the only
+    way to exercise CHECK_TIMEOUT_SECONDS without waiting five real minutes,
+    since the cap is deliberately not configurable from outside.
+    """
+    import importlib.machinery
+    import importlib.util
+
+    spec = importlib.util.spec_from_loader(
+        "greenline_mod",
+        importlib.machinery.SourceFileLoader("greenline_mod", GREENLINE),
+    )
+    mod = importlib.util.module_from_spec(spec)
+    # dataclasses resolves annotations via sys.modules, so register before exec.
+    sys.modules["greenline_mod"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def pid_is_gone(pid: int, wait_s: float = 10.0) -> bool:
+    deadline = time.time() + wait_s
+    while time.time() < deadline:
+        try:
+            os.kill(pid, 0)
+        except (ProcessLookupError, PermissionError):
+            return True
+        time.sleep(0.05)
+    return False
+
+
 def common_dir(repo: Path) -> Path:
     out = run_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
     return Path(out).resolve()
@@ -679,6 +729,58 @@ def test_adopt_happy_path(tmp_path):
     gl(repo, "doctor", expect=0)
 
 
+def test_adopt_bootstraps_a_never_deployed_repo(tmp_path):
+    """After setup, main == last-green but nothing has ever been deployed and
+    origin is behind. Direct pushes are hook-blocked, so adopt is the ONLY path
+    to first deploy — it must not refuse with 'nothing to adopt'."""
+    repo = setup_repo(tmp_path, "bootstrap-adopt", with_origin=True)
+    tip = sha(repo, "main")
+    deployed_path = common_dir(repo) / "greenline" / "deployed"
+    assert not deployed_path.exists(), "precondition: nothing deployed yet"
+    assert sha(repo, "refs/greenline/last-green") == tip
+    run_git(repo, "fetch", "-q", "origin")
+    assert sha(repo, "origin/main") != tip, "precondition: origin behind main"
+
+    p = gl(repo, "adopt", expect=0)
+    assert "ADOPTED" in p.stdout
+
+    kinds = [r.split()[0] for r in record_lines(repo)]
+    assert kinds == ["check", "deploy"]
+    assert deployed_path.read_text().strip() == tip
+    assert sha(repo, "main") == tip
+    assert sha(repo, "refs/greenline/last-green") == tip
+    run_git(repo, "fetch", "-q", "origin")
+    assert sha(repo, "origin/main") == tip, "adopt must publish the bootstrap tip"
+    assert journal_events(repo)[-1]["event"] == "complete"
+    gl(repo, "doctor", expect=0)
+
+    # now everything agrees -> a second adopt is a no-op refusal
+    p2 = gl(repo, "adopt", expect=0)
+    assert "nothing to adopt" in p2.stdout
+    assert [r.split()[0] for r in record_lines(repo)] == ["check", "deploy"]
+
+
+def test_adopt_bootstrap_deploy_failure_never_attempts_rollback(tmp_path):
+    """No previously-deployed SHA exists, so there is nothing to roll back to:
+    say prod is unknown rather than re-running the same failing deploy."""
+    repo = setup_repo(tmp_path, "bootstrap-fail")
+    tip = sha(repo, "main")
+    (common_dir(repo) / "FAIL_DEPLOY").write_text("")  # empty = fail every deploy
+
+    p = gl(repo, "adopt", expect=1)
+    assert "PROD STATE IS UNKNOWN" in p.stdout
+    assert "PROD IS INTENTIONALLY BEHIND MAIN" not in p.stdout
+
+    # exactly ONE deploy attempt — no rollback deploy
+    assert [r.split()[0] for r in record_lines(repo)] == ["check", "deploy"]
+    assert not (common_dir(repo) / "greenline" / "deployed").exists()
+    assert sha(repo, "main") == tip
+    assert sha(repo, "refs/greenline/last-green") == tip
+    last = journal_events(repo)[-1]
+    assert last["event"] == "adopt_failed"
+    assert last["stage"] == "deploy" and last.get("bootstrap") is True
+
+
 def test_adopt_deploy_failure_restores_prod_never_resets_main(tmp_path):
     repo = setup_repo(tmp_path)
     last_green = sha(repo, "refs/greenline/last-green")
@@ -956,22 +1058,83 @@ def test_deploy_pending_publishes_what_it_deploys(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# the five-minute check cap (doctrine)
+# --------------------------------------------------------------------------
+# The check pipeline must finish in under 5 minutes; longer is automatically a
+# gate FAIL. There is no config override, so these tests patch the constant in
+# an in-process import of the CLI rather than waiting for the real cap.
+
+
+def test_check_timeout_default_is_five_minutes():
+    mod = load_greenline_module()
+    assert mod.CHECK_TIMEOUT_SECONDS == 300
+
+
+def test_check_timeout_fails_the_gate_and_reaps_children(tmp_path, capsys):
+    repo = setup_repo(tmp_path, "slowcheck")
+    main_before = sha(repo, "main")
+    lg_before = sha(repo, "refs/greenline/last-green")
+    wt = make_worktree(repo, "slow")
+    write_run_script(wt, SLOW_CHECK)
+    run_git(wt, "add", "-A")
+    run_git(wt, "commit", "-q", "-m", "slow check")
+
+    mod = load_greenline_module()
+    mod.CHECK_TIMEOUT_SECONDS = 2
+    rc = mod.main(["submit", "--repo", str(wt)])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "CHECK TIMED OUT" in out
+    assert "5 minutes" in out and "DOCTRINE.md" in out
+
+    # the check's grandchild (a bare `sleep`) must have been reaped with the group
+    child = int((common_dir(repo) / "slow-child.pid").read_text().strip())
+    assert pid_is_gone(child), f"child {child} survived the timeout kill"
+
+    # gate FAIL semantics: nothing moved, nothing deployed
+    assert sha(repo, "main") == main_before
+    assert sha(repo, "refs/greenline/last-green") == lg_before
+    assert [r.split()[0] for r in record_lines(repo)] == ["check"]
+    assert not (common_dir(repo) / "greenline" / "deployed").exists()
+    assert sha(repo, "gl/slow")  # branch preserved
+
+    last = journal_events(repo)[-1]
+    assert last["event"] == "fail" and last["stage"] == "check"
+    assert last["reason"] == mod.CHECK_TIMEOUT_REASON
+
+
+def test_adopt_check_timeout_is_a_failure_too(tmp_path, capsys):
+    repo = setup_repo(tmp_path, "slowadopt")
+    lg_before = sha(repo, "refs/greenline/last-green")
+    with with_main_unlocked(repo):
+        write_run_script(repo, SLOW_CHECK)
+        run_git(repo, "add", "-A")
+        run_git(repo, "commit", "-q", "-m", "slow check on main")
+    tip = sha(repo, "main")
+
+    mod = load_greenline_module()
+    mod.CHECK_TIMEOUT_SECONDS = 2
+    rc = mod.main(["adopt", "--repo", str(repo)])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "CHECK TIMED OUT" in out
+
+    assert sha(repo, "main") == tip, "main must never be reset by adopt"
+    assert sha(repo, "refs/greenline/last-green") == lg_before
+    assert [r.split()[0] for r in record_lines(repo)] == ["check"]
+    assert not (common_dir(repo) / "greenline" / "deployed").exists()
+    last = journal_events(repo)[-1]
+    assert last["event"] == "adopt_failed" and last["stage"] == "check"
+    assert last["reason"] == mod.CHECK_TIMEOUT_REASON
+
+
+# --------------------------------------------------------------------------
 # portability
 # --------------------------------------------------------------------------
 def test_default_worktree_base_falls_back_off_the_authors_volume(tmp_path, monkeypatch):
     """greenline is published publicly; its default must not assume one machine's
     external drive exists."""
-    import importlib.machinery
-    import importlib.util
-
-    spec = importlib.util.spec_from_loader(
-        "greenline_mod",
-        importlib.machinery.SourceFileLoader("greenline_mod", GREENLINE),
-    )
-    mod = importlib.util.module_from_spec(spec)
-    # dataclasses resolves annotations via sys.modules, so register before exec.
-    sys.modules["greenline_mod"] = mod
-    spec.loader.exec_module(mod)
+    mod = load_greenline_module()
 
     home = tmp_path / "home"
     home.mkdir()

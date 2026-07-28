@@ -87,6 +87,30 @@ the tests themselves are designed **together** to survive this environment:
   summary constraint that all the above serve. If two agents cannot both run
   `./run check` at the same moment without interfering, the check is broken.
 
+## The five-minute check
+
+**`check` must finish in under five minutes. Over that, the gate kills it and
+fails the submission** — same verdict as a red test, and the whole process group
+dies with it. This is a hard limit: there is no config knob, and there is no
+repo whose suite is "just legitimately slow". A gate nobody can afford to wait
+for is a gate that gets bypassed.
+
+The remedy is never raising the limit. It is making the suite fast:
+
+- **Parallelize.** The co-design rules above exist so tests can run at once —
+  isolated schemas, namespaces, ports and temp dirs per test mean nothing has to
+  be serialized for correctness. Run them wide.
+- **Start from a known position.** Prebuilt fixtures, seeded snapshots, a
+  restore-from-template database — never rebuild the world per test.
+- **Keep the build warm.** The gate worktree is persistent on purpose: leave
+  build/dependency caches (`target/`, `.venv`, node_modules, record/replay
+  caches) in place so a submission compiles only its own diff.
+- **Validate incrementally.** Cheap and decisive first — compile, then lint,
+  then unit, then integration. Fail fast before paying for the slow stages.
+- **Split monolithic integration tests.** One 4-minute end-to-end test is a
+  single-threaded wall; several focused ones run concurrently.
+- **Cache the external world** — see the next section.
+
 ## Real but fast: record/replay caches for external services
 
 Tests must be **real** — mocking, faking, or stubbing another service is forbidden,

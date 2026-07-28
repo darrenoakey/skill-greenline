@@ -17,6 +17,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import tomllib
 from dataclasses import dataclass
@@ -30,6 +31,12 @@ MARK_END = "# <<< greenline <<<"
 MD_BEGIN = "<!-- >>> greenline >>> -->"
 MD_END = "<!-- <<< greenline <<< -->"
 LAST_GREEN_REF = "refs/greenline/last-green"
+
+# Doctrine: the check pipeline must finish in under five minutes. A longer run
+# is automatically a gate FAIL. Deliberately NOT configurable — a repo whose
+# check outgrows this makes the suite faster, it does not raise the cap.
+CHECK_TIMEOUT_SECONDS = 300
+CHECK_TIMEOUT_REASON = "check exceeded the 5-minute doctrine cap"
 
 SKILL_DIR = Path(__file__).resolve().parent
 TEMPLATE_DIR = SKILL_DIR / "templates"
@@ -524,14 +531,38 @@ def last_incomplete_gate(repo: Repo) -> dict | None:
 # --------------------------------------------------------------------------
 # command runner (tee to log)
 # --------------------------------------------------------------------------
-def run_shell(cmd: str, cwd: Path, log_path: Path) -> int:
-    """Run a shell command, tee stdout+stderr to log file, return exit code.
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    """SIGTERM then SIGKILL the child's whole process group.
 
-    Strips CLAUDECODE from the child env (house gotcha: it can SIGSEGV CLIs).
+    A check spawns cargo/pytest/node children; killing only the shell leaves
+    them running (and holding the gate's stdout pipe open forever). The child
+    is a session/group leader (start_new_session=True), so its pid is the pgid.
+    """
+    try:
+        pgid = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        return
+    for sig, grace in ((signal.SIGTERM, 5.0), (signal.SIGKILL, 5.0)):
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(pgid, sig)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=grace)
+            return
+
+
+def run_shell_timed(
+    cmd: str, cwd: Path, log_path: Path, timeout: float | None = None
+) -> tuple[int, bool]:
+    """Run a shell command, tee stdout+stderr to log file.
+
+    Returns (exit code, timed_out). Strips CLAUDECODE from the child env
+    (house gotcha: it can SIGSEGV CLIs). With a timeout, the child runs in its
+    own session so the entire process group can be reaped on expiry.
     """
     env = os.environ.copy()
     env.pop("CLAUDECODE", None)
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    timed_out = False
     with log_path.open("a") as log:
         log.write(f"\n$ ({cwd}) {cmd}\n")
         log.flush()
@@ -544,14 +575,58 @@ def run_shell(cmd: str, cwd: Path, log_path: Path) -> int:
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            start_new_session=True,
         )
-        for line in proc.stdout:  # type: ignore[union-attr]
-            log.write(line)
-            if VERBOSE:
-                sys.stdout.write(line)
-        proc.wait()
-        log.write(f"[exit {proc.returncode}]\n")
-    return proc.returncode
+
+        def pump() -> None:
+            for line in proc.stdout:  # type: ignore[union-attr]
+                log.write(line)
+                if VERBOSE:
+                    sys.stdout.write(line)
+
+        # Tee on a thread so the wall-clock deadline is enforced even while the
+        # child is silent (a blocking read on stdout would ignore it).
+        reader = threading.Thread(target=pump, daemon=True)
+        reader.start()
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            log.write(f"[timeout after {timeout}s — killing process group]\n")
+            _kill_process_group(proc)
+        reader.join(timeout=10)
+        log.write(f"[exit {proc.returncode}]{' (TIMED OUT)' if timed_out else ''}\n")
+    return proc.returncode, timed_out
+
+
+def run_shell(cmd: str, cwd: Path, log_path: Path, timeout: float | None = None) -> int:
+    rc, _ = run_shell_timed(cmd, cwd, log_path, timeout)
+    return rc
+
+
+def run_gate_check(repo: Repo, cwd: Path, log_path: Path) -> tuple[int, bool]:
+    """Run the repo's check under the hard doctrine time cap.
+
+    Returns (exit code, timed_out). A timed-out check is a gate FAIL exactly
+    like a red test — see check_timeout_banner().
+    """
+    return run_shell_timed(repo.check_cmd, cwd, log_path, CHECK_TIMEOUT_SECONDS)
+
+
+def check_timeout_banner(log_path: Path) -> None:
+    mins = CHECK_TIMEOUT_SECONDS / 60
+    say("")
+    say("=" * 60)
+    say(f"CHECK TIMED OUT after {CHECK_TIMEOUT_SECONDS:.0f}s "
+        f"({mins:g} min) — GATE FAILED.")
+    say("The check pipeline must finish in under 5 minutes. This is a hard")
+    say("doctrine limit: there is no config override, and the remedy is never")
+    say("raising it — it is making the suite fast (parallelize with isolated")
+    say("namespaces, start from prebuilt fixtures, warm caches, fail fast on")
+    say("build/lint before the slow suites, split monolithic integration tests).")
+    say("Playbook: docs/DOCTRINE.md -> 'The five-minute check'.")
+    say("=" * 60)
+    say(f"log: {log_path}")
 
 
 def log_tail(log_path: Path, n: int = 50) -> str:
@@ -905,6 +980,19 @@ def prod_behind_banner(repo: Repo, main_sha: str | None, prod_sha: str | None) -
         f"{short(repo.canonical, prod_sha) if prod_sha else '?'}.\n"
         "Fix forward immediately: repair the code on main and re-run the gate\n"
         "(greenline adopt for in-place main commits).\n"
+        + "=" * 60
+    )
+
+
+def prod_unknown_banner(repo: Repo, tip: str | None) -> None:
+    """No known-good SHA to roll back to — say so loudly instead of pretending."""
+    say(
+        "\n" + "=" * 60 + "\n"
+        "PROD STATE IS UNKNOWN.\n"
+        f"The deploy of {short(repo.canonical, tip) if tip else '?'} failed and this "
+        "repo has no previously\n"
+        "deployed commit to restore — nothing was rolled back and main was not reset.\n"
+        "FIX FORWARD: repair the deploy, then re-run `greenline adopt`.\n"
         + "=" * 60
     )
 
@@ -1366,9 +1454,12 @@ def cmd_submit(args) -> int:
             # check
             lock.set_phase("checking", branch)
             say(f"checking candidate {short(gate, 'HEAD')} ...")
-            rc = run_shell(repo.check_cmd, gate, log_path)
-            if rc != 0:
-                journal(repo, "fail", stage="check", branch=branch, candidate=C, rc=rc)
+            rc, timed_out = run_gate_check(repo, gate, log_path)
+            if rc != 0 or timed_out:
+                journal(
+                    repo, "fail", stage="check", branch=branch, candidate=C, rc=rc,
+                    **({"reason": CHECK_TIMEOUT_REASON} if timed_out else {}),
+                )
                 git(gate, "reset", "--hard", main)
                 git(gate, "clean", "-fd")
                 # This candidate never reached main, but an EARLIER one may have
@@ -1376,8 +1467,12 @@ def cmd_submit(args) -> int:
                 # of the burst, so ship that known-good main now instead of
                 # leaving prod behind a commit nobody will come back for.
                 flush_pending_deploy(repo, log_path, lock, branch)
-                say(f"CHECK FAILED (exit {rc}). main is untouched; branch preserved.")
-                say(f"log: {log_path}")
+                if timed_out:
+                    check_timeout_banner(log_path)
+                    say("main is untouched; branch preserved.")
+                else:
+                    say(f"CHECK FAILED (exit {rc}). main is untouched; branch preserved.")
+                    say(f"log: {log_path}")
                 say("--- last 50 lines ---")
                 say(log_tail(log_path, 50))
                 return 1
@@ -1472,11 +1567,18 @@ def cmd_adopt(args) -> int:
 
             tip = rev(repo.canonical, main)
             last_green = rev(repo.canonical, LAST_GREEN_REF)
+            deployed = read_deployed(repo)
             if not tip:
                 die(f"no {main} branch to adopt", 2)
-            if tip == last_green:
+            if tip == last_green and deployed == tip:
                 say("main already == last-green; nothing to adopt")
                 return 0
+            # BOOTSTRAP: main == last-green (setup just committed the
+            # scaffolding) but prod has never been deployed by a gate, so
+            # `deployed` is missing or stale. Direct pushes to main are
+            # hook-blocked by design, which used to leave no way at all to
+            # deploy/publish/initialize a freshly set-up repo. Adopt is that
+            # path: full check + deploy + publish, no ref mutation needed.
 
             ensure_gate_worktree(repo)
             journal(
@@ -1487,13 +1589,20 @@ def cmd_adopt(args) -> int:
             # check at the main tip in the gate worktree
             lock.set_phase("checking", "adopt")
             say(f"checking main tip {short(repo.canonical, tip)} ...")
-            rc = run_shell(repo.check_cmd, repo.gate_path, log_path)
-            if rc != 0:
-                journal(repo, "adopt_failed", stage="check", candidate=tip, rc=rc)
-                say(f"CHECK FAILED (exit {rc}). main untouched; prod untouched.")
+            rc, timed_out = run_gate_check(repo, repo.gate_path, log_path)
+            if rc != 0 or timed_out:
+                journal(
+                    repo, "adopt_failed", stage="check", candidate=tip, rc=rc,
+                    **({"reason": CHECK_TIMEOUT_REASON} if timed_out else {}),
+                )
+                if timed_out:
+                    check_timeout_banner(log_path)
+                    say("main untouched; prod untouched.")
+                else:
+                    say(f"CHECK FAILED (exit {rc}). main untouched; prod untouched.")
+                    say(f"log: {log_path}")
                 say("Fix the code on main (or revert the offending commits), then re-run"
                     " greenline adopt.")
-                say(f"log: {log_path}")
                 say(log_tail(log_path, 50))
                 return 1
             journal(repo, "checked", candidate=tip)
@@ -1503,13 +1612,29 @@ def cmd_adopt(args) -> int:
             say("deploying to prod ...")
             drc = run_shell(repo.deploy_cmd, repo.canonical, log_path)
             if drc != 0:
-                say(f"DEPLOY FAILED (exit {drc}) — restoring prod to last-green"
-                    " (main is NOT reset; those commits are preserved).")
-                if last_green and last_green != tip:
-                    redeploy_detached(repo, last_green, log_path)
-                    write_deployed(repo, last_green)
-                journal(repo, "adopt_failed", stage="deploy", candidate=tip, rc=drc)
-                prod_behind_banner(repo, tip, last_green)
+                # Prefer the SHA prod actually ran (deployed) over last-green:
+                # after setup --refresh-docs, last-green == tip while deployed
+                # still names the known-good build.
+                restore = next(
+                    (s for s in (deployed, last_green) if s and s != tip), None
+                )
+                if restore:
+                    say(f"DEPLOY FAILED (exit {drc}) — restoring prod to last-green"
+                        " (main is NOT reset; those commits are preserved).")
+                    redeploy_detached(repo, restore, log_path)
+                    write_deployed(repo, restore)
+                    journal(repo, "adopt_failed", stage="deploy", candidate=tip, rc=drc)
+                    prod_behind_banner(repo, tip, restore)
+                else:
+                    # Bootstrap: there is no previously-deployed SHA to fall
+                    # back to, so a rollback deploy would be theatre — it would
+                    # re-run the same failing command on the same tree.
+                    say(f"DEPLOY FAILED (exit {drc}).")
+                    journal(
+                        repo, "adopt_failed", stage="deploy", candidate=tip, rc=drc,
+                        bootstrap=True,
+                    )
+                    prod_unknown_banner(repo, tip)
                 say(f"log: {log_path}")
                 say(log_tail(log_path, 50))
                 return 1
