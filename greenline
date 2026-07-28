@@ -1191,14 +1191,76 @@ def cmd_setup(args) -> int:
     else:
         say("docs/greenline.md exists — leaving it (--refresh-docs to re-render)")
 
+    # land the scaffolding ourselves: the hooks we just installed make a
+    # manual `git commit` on main impossible, so setup must commit its own
+    # files under the same allow-main authorization the gate uses.
+    pre_main = rev(canon, main)
+    new_tip = commit_scaffolding(repo, main)
+    if new_tip:
+        say(f"committed greenline scaffolding on {main} ({short(canon, new_tip)})")
+        if rev(canon, LAST_GREEN_REF) == pre_main:
+            # last-green tracked the pre-scaffolding tip: keep main == last-green
+            # so worktrees branch off a base that already carries greenline.toml.
+            set_last_green(repo, new_tip)
+            say(f"moved {LAST_GREEN_REF} -> {short(canon, new_tip)}")
+        else:
+            warn(
+                f"{main} is now ahead of {LAST_GREEN_REF} — gate the scaffolding "
+                "commit with: greenline adopt"
+            )
+
     say("")
     _doctor_report(repo)
     say("")
     say("next steps:")
-    say(f"  git -C {canon} add greenline.toml AGENTS.md docs/greenline.md docs/DOCTRINE.md")
-    say("  git commit -m 'Add greenline gate config'")
     say("  greenline worktree <name>   # start work")
     return 0
+
+
+# Exactly the files setup itself writes. Nothing else is ever staged, so
+# unrelated dirt in the canonical checkout stays uncommitted (and doctor keeps
+# reporting it).
+SCAFFOLD_PATHS = ("greenline.toml", "AGENTS.md", "docs/greenline.md", "docs/DOCTRINE.md")
+SCAFFOLD_COMMIT_MSG = "Add greenline gate config"
+
+
+def scaffolding_dirty(canon: Path) -> list[str]:
+    """Which of SCAFFOLD_PATHS are modified or untracked in the canonical."""
+    dirty = []
+    for rel in SCAFFOLD_PATHS:
+        if not (canon / rel).exists():
+            continue
+        if git_out(canon, "status", "--porcelain", "--untracked-files=all", "--", rel):
+            dirty.append(rel)
+    return dirty
+
+
+def commit_scaffolding(repo: Repo, main: str) -> str | None:
+    """Commit greenline's own scaffolding on main; return the new tip, or None.
+
+    setup installs hard main-lock hooks and THEN writes greenline.toml,
+    AGENTS.md and the docs — so telling the user to `git commit` them is
+    telling them to do something the just-installed pre-commit hook refuses.
+    We hold allow-main (same flag as the gate) for exactly this one commit and
+    drop it in a finally block, so a crash can never leave main writable.
+    Idempotent: nothing dirty among those paths means no commit.
+    """
+    canon = repo.canonical
+    if current_branch(canon) != main:
+        return None
+    dirty = scaffolding_dirty(canon)
+    if not dirty:
+        return None
+    unborn = rev(canon, "HEAD") is None
+    with allow_main_updates(repo):
+        git(canon, "add", "--", *dirty)
+        if unborn:
+            git(canon, "commit", "-m", SCAFFOLD_COMMIT_MSG)
+        else:
+            # pathspec commit: whatever else happens to be staged in the
+            # canonical index is left alone.
+            git(canon, "commit", "-m", SCAFFOLD_COMMIT_MSG, "--", *dirty)
+    return rev(canon, main)
 
 
 def install_doctrine(repo: Repo) -> None:

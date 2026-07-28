@@ -145,9 +145,10 @@ def seed_config(repo: Path, tmp_path: Path, name: str, coalesce: bool = False):
 def with_main_unlocked(repo: Path):
     """Authorize local main-ref mutations the same way the gate does.
 
-    Tests that need to plant out-of-gate main state (adopt/drift/recovery)
-    or commit setup scaffolding on main after hooks are installed use this.
-    Production agents/humans never get this path.
+    Only for tests that deliberately plant out-of-gate main state
+    (adopt/drift/recovery). Setup commits its own scaffolding, so no test
+    needs this to bootstrap a repo. Production agents/humans never get this
+    path.
     """
     allow = common_dir(repo) / "greenline" / "allow-main"
     allow.parent.mkdir(parents=True, exist_ok=True)
@@ -161,13 +162,12 @@ def with_main_unlocked(repo: Path):
 def setup_repo(tmp_path: Path, name="proj", with_origin=False, coalesce=False) -> Path:
     repo = make_repo(tmp_path, name, RUN_RECORDER, with_origin=with_origin)
     seed_config(repo, tmp_path, name, coalesce=coalesce)
-    # setup honours the pre-seeded toml -> gate worktree lands in tmp
+    # setup honours the pre-seeded toml -> gate worktree lands in tmp.
+    # It also commits its own scaffolding on main and moves last-green to it,
+    # so worktrees branch off a base that carries greenline.toml.
     gl(repo, "setup", expect=0)
-    with with_main_unlocked(repo):
-        run_git(repo, "add", "-A")
-        run_git(repo, "commit", "-q", "-m", "greenline config")
-    # last-green must point at the config commit so worktrees carry greenline.toml
-    run_git(repo, "update-ref", "refs/greenline/last-green", "main")
+    assert not run_git(repo, "status", "--porcelain")
+    assert sha(repo, "refs/greenline/last-green") == sha(repo, "main")
     return repo
 
 
@@ -239,7 +239,8 @@ def test_setup_idempotent(tmp_path):
     for hook_name in ("pre-push", "reference-transaction", "pre-commit"):
         hook = common_dir(repo) / "hooks" / hook_name
         assert hook.exists(), hook_name
-        # second run must not fail nor duplicate the marked section
+        # second run must not fail, duplicate the marked section, or commit again
+    first_tip = sha(repo, "main")
     gl(repo, "setup", expect=0)
     agents_twice = (repo / "AGENTS.md").read_text()
     assert agents_twice.count(">>> greenline >>>") == 1
@@ -247,6 +248,50 @@ def test_setup_idempotent(tmp_path):
         hook_text = (common_dir(repo) / "hooks" / hook_name).read_text()
         assert hook_text.count(">>> greenline >>>") == 1, hook_name
     assert sha(repo, "refs/greenline/last-green")
+    assert sha(repo, "main") == first_tip, "idempotent setup must not commit again"
+    assert not run_git(repo, "status", "--porcelain")
+
+
+def test_setup_commits_its_own_scaffolding(tmp_path):
+    """The hooks setup installs forbid commits on main — so setup must land
+    its own greenline.toml/AGENTS.md/docs itself, under allow-main."""
+    repo = make_repo(tmp_path, "bootstrap", RUN_RECORDER)
+    seed_config(repo, tmp_path, "bootstrap")
+    # unrelated dirt must survive setup untouched
+    (repo / "unrelated.txt").write_text("mine\n")
+
+    proc = gl(repo, "setup", expect=0)
+    assert "git commit -m" not in proc.stdout, "obsolete manual-commit instructions"
+
+    # scaffolding is committed; only the unrelated file is still dirty
+    assert run_git(repo, "status", "--porcelain") == "?? unrelated.txt"
+    assert run_git(repo, "log", "-1", "--format=%s", "main") == "Add greenline gate config"
+    committed = run_git(repo, "show", "--name-only", "--format=", "main").split()
+    assert sorted(committed) == sorted(
+        ["AGENTS.md", "docs/DOCTRINE.md", "docs/greenline.md", "greenline.toml"]
+    )
+    # main == last-green, and the allow-main flag is gone
+    assert sha(repo, "refs/greenline/last-green") == sha(repo, "main")
+    assert not (common_dir(repo) / "greenline" / "allow-main").exists()
+
+    # unrelated dirt is still reported by doctor exactly as before
+    assert "[FAIL] canonical clean" in proc.stdout
+    # with it gone, doctor is fully green after a bare setup
+    (repo / "unrelated.txt").unlink()
+    pd = gl(repo, "doctor", expect=0)
+    assert "FAIL" not in pd.stdout
+
+    # and the lock is still real: a direct commit on main is refused
+    (repo / "after.txt").write_text("nope\n")
+    run_git(repo, "add", "-A")
+    blocked = subprocess.run(
+        ["git", "-C", str(repo), "commit", "--no-verify", "-m", "direct"],
+        capture_output=True, text=True,
+    )
+    assert blocked.returncode != 0
+    assert "greenline" in (blocked.stdout + blocked.stderr).lower()
+    run_git(repo, "restore", "--staged", "--worktree", ".")
+    run_git(repo, "clean", "-fd")
 
 
 def test_worktree_off_last_green(tmp_path):
