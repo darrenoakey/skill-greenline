@@ -6,6 +6,7 @@ in git worktrees branched from the last-green commit. Every merge to main goes
 through ONE serialized quality gate that runs the full check suite and a real
 deploy of prod. Stdlib only; no environment-variable configuration.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -77,7 +78,9 @@ def utcstamp() -> str:
 # --------------------------------------------------------------------------
 # git plumbing — always explicit -C, never rely on cwd
 # --------------------------------------------------------------------------
-def git(path: str | Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+def git(
+    path: str | Path, *args: str, check: bool = True
+) -> subprocess.CompletedProcess:
     cmd = ["git", "-C", str(path), *args]
     vsay("$ " + " ".join(cmd))
     proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -157,11 +160,11 @@ def list_worktrees(path: str | Path) -> list[dict]:
         if line.startswith("worktree "):
             if cur:
                 trees.append(cur)
-            cur = {"worktree": line[len("worktree "):]}
+            cur = {"worktree": line[len("worktree ") :]}
         elif line.startswith("branch "):
-            cur["branch"] = line[len("branch "):]
+            cur["branch"] = line[len("branch ") :]
         elif line.startswith("HEAD "):
-            cur["head"] = line[len("HEAD "):]
+            cur["head"] = line[len("HEAD ") :]
     if cur:
         trees.append(cur)
     return trees
@@ -307,6 +310,16 @@ def load_repo(start: str | Path | None) -> Repo:
     canon = canonical_path(start)
     common = git_common_dir(start)
     cfg_path = canon / "greenline.toml"
+    if not cfg_path.exists():
+        # Bootstrap submissions can legitimately add greenline.toml in their
+        # feature worktree before it exists in the canonical checkout. Read
+        # that committed candidate config so a non-"main" default branch and
+        # custom gate path are honoured while the first branch is gated. Once
+        # merged, the canonical config resumes being authoritative.
+        worktree_root = Path(git_out(start, "rev-parse", "--show-toplevel")).resolve()
+        candidate_cfg = worktree_root / "greenline.toml"
+        if candidate_cfg.exists():
+            cfg_path = candidate_cfg
     config: dict = {}
     if cfg_path.exists():
         with cfg_path.open("rb") as fh:
@@ -382,7 +395,9 @@ class GateLock:
                 elapsed = f" elapsed={int((datetime.now(timezone.utc) - t0).total_seconds())}s"
         say(f"  holder pid={pid} branch={branch} phase={phase}{elapsed}")
 
-    def set_phase(self, phase: str, branch: str, started_utc: str | None = None) -> None:
+    def set_phase(
+        self, phase: str, branch: str, started_utc: str | None = None
+    ) -> None:
         st = read_json(self.repo.status_path) or {}
         st["pid"] = os.getpid()
         st["branch"] = branch
@@ -617,8 +632,10 @@ def check_timeout_banner(log_path: Path) -> None:
     mins = CHECK_TIMEOUT_SECONDS / 60
     say("")
     say("=" * 60)
-    say(f"CHECK TIMED OUT after {CHECK_TIMEOUT_SECONDS:.0f}s "
-        f"({mins:g} min) — GATE FAILED.")
+    say(
+        f"CHECK TIMED OUT after {CHECK_TIMEOUT_SECONDS:.0f}s "
+        f"({mins:g} min) — GATE FAILED."
+    )
     say("The check pipeline must finish in under 5 minutes. This is a hard")
     say("doctrine limit: there is no config override, and the remedy is never")
     say("raising it — it is making the suite fast (parallelize with isolated")
@@ -730,7 +747,11 @@ def preflight_reconcile(repo: Repo, log_path: Path) -> None:
     if last_green and main_sha and last_green != main_sha:
         lg_is_ancestor = (
             git(
-                repo.canonical, "merge-base", "--is-ancestor", last_green, main_sha,
+                repo.canonical,
+                "merge-base",
+                "--is-ancestor",
+                last_green,
+                main_sha,
                 check=False,
             ).returncode
             == 0
@@ -761,7 +782,11 @@ def preflight_reconcile(repo: Repo, log_path: Path) -> None:
             else:
                 # is origin strictly ahead (ff possible)?
                 mb = git(
-                    repo.canonical, "merge-base", "--is-ancestor", main_sha, origin,
+                    repo.canonical,
+                    "merge-base",
+                    "--is-ancestor",
+                    main_sha,
+                    origin,
                     check=False,
                 )
                 if mb.returncode == 0:
@@ -788,7 +813,9 @@ def recover_incomplete(repo: Repo, inc: dict, log_path: Path) -> None:
     C = inc.get("candidate")
     phases = set(inc.get("_phase_events", []))
     deployed = read_deployed(repo)
-    origin = rev(repo.canonical, f"origin/{main}") if remote_exists(repo.canonical) else None
+    origin = (
+        rev(repo.canonical, f"origin/{main}") if remote_exists(repo.canonical) else None
+    )
 
     say("greenline: recovering incomplete gate from journal...")
 
@@ -895,7 +922,9 @@ def deploy_now(repo: Repo, sha: str, log_path: Path) -> int:
     return rc
 
 
-def flush_pending_deploy(repo: Repo, log_path: Path, lock=None, branch: str = "") -> bool:
+def flush_pending_deploy(
+    repo: Repo, log_path: Path, lock=None, branch: str = ""
+) -> bool:
     """Deploy a previously deferred, already-gated main tip.
 
     Called on the paths where THIS submission produced nothing deployable (merge
@@ -922,7 +951,9 @@ def flush_pending_deploy(repo: Repo, log_path: Path, lock=None, branch: str = ""
     rc = deploy_now(repo, tip, log_path)
     if rc != 0:
         journal(repo, "pending_deploy_failed", pending=pending, tip=tip, rc=rc)
-        warn(f"deferred deploy FAILED (exit {rc}); prod is behind main. log: {log_path}")
+        warn(
+            f"deferred deploy FAILED (exit {rc}); prod is behind main. log: {log_path}"
+        )
         return False
     settle_green(repo, tip)
     journal(repo, "pending_deployed", tip=tip)
@@ -979,8 +1010,7 @@ def prod_behind_banner(repo: Repo, main_sha: str | None, prod_sha: str | None) -
         f"main is {short(repo.canonical, main_sha) if main_sha else '?'} but prod runs "
         f"{short(repo.canonical, prod_sha) if prod_sha else '?'}.\n"
         "Fix forward immediately: repair the code on main and re-run the gate\n"
-        "(greenline adopt for in-place main commits).\n"
-        + "=" * 60
+        "(greenline adopt for in-place main commits).\n" + "=" * 60
     )
 
 
@@ -992,8 +1022,7 @@ def prod_unknown_banner(repo: Repo, tip: str | None) -> None:
         f"The deploy of {short(repo.canonical, tip) if tip else '?'} failed and this "
         "repo has no previously\n"
         "deployed commit to restore — nothing was rolled back and main was not reset.\n"
-        "FIX FORWARD: repair the deploy, then re-run `greenline adopt`.\n"
-        + "=" * 60
+        "FIX FORWARD: repair the deploy, then re-run `greenline adopt`.\n" + "=" * 60
     )
 
 
@@ -1268,7 +1297,9 @@ def cmd_setup(args) -> int:
         upsert_marked(agents_path, agents_block, MD_BEGIN, MD_END)
         say(f"updated {agents_path}")
     else:
-        say("AGENTS.md greenline section exists — leaving it (--refresh-docs to re-render)")
+        say(
+            "AGENTS.md greenline section exists — leaving it (--refresh-docs to re-render)"
+        )
 
     docs_path = canon / "docs" / "greenline.md"
     if args.refresh_docs or not docs_path.exists():
@@ -1308,7 +1339,12 @@ def cmd_setup(args) -> int:
 # Exactly the files setup itself writes. Nothing else is ever staged, so
 # unrelated dirt in the canonical checkout stays uncommitted (and doctor keeps
 # reporting it).
-SCAFFOLD_PATHS = ("greenline.toml", "AGENTS.md", "docs/greenline.md", "docs/DOCTRINE.md")
+SCAFFOLD_PATHS = (
+    "greenline.toml",
+    "AGENTS.md",
+    "docs/greenline.md",
+    "docs/DOCTRINE.md",
+)
 SCAFFOLD_COMMIT_MSG = "Add greenline gate config"
 
 
@@ -1370,7 +1406,9 @@ def cmd_worktree(args) -> int:
     if rev(repo.canonical, f"refs/heads/{branch}"):
         die(f"branch {branch} already exists")
     with GateLock(repo):
-        base = rev(repo.canonical, LAST_GREEN_REF) or rev(repo.canonical, repo.main_branch)
+        base = rev(repo.canonical, LAST_GREEN_REF) or rev(
+            repo.canonical, repo.main_branch
+        )
         if not base:
             die("no last-green ref and no main tip to branch from", 2)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -1399,7 +1437,9 @@ def cmd_submit(args) -> int:
     base_ref = rev(repo.canonical, LAST_GREEN_REF) or rev(repo.canonical, main)
     mb = git_out(repo.canonical, "merge-base", branch, base_ref)
     if mb == rev(repo.canonical, branch):
-        die(f"branch {branch} has no commits ahead of last-green/main (empty candidate)")
+        die(
+            f"branch {branch} has no commits ahead of last-green/main (empty candidate)"
+        )
 
     log_path = repo.logs_dir / f"{utcnow()}-{branch.replace('/', '_')}.log"
     lock = GateLock(repo)
@@ -1457,7 +1497,12 @@ def cmd_submit(args) -> int:
             rc, timed_out = run_gate_check(repo, gate, log_path)
             if rc != 0 or timed_out:
                 journal(
-                    repo, "fail", stage="check", branch=branch, candidate=C, rc=rc,
+                    repo,
+                    "fail",
+                    stage="check",
+                    branch=branch,
+                    candidate=C,
+                    rc=rc,
                     **({"reason": CHECK_TIMEOUT_REASON} if timed_out else {}),
                 )
                 git(gate, "reset", "--hard", main)
@@ -1471,7 +1516,9 @@ def cmd_submit(args) -> int:
                     check_timeout_banner(log_path)
                     say("main is untouched; branch preserved.")
                 else:
-                    say(f"CHECK FAILED (exit {rc}). main is untouched; branch preserved.")
+                    say(
+                        f"CHECK FAILED (exit {rc}). main is untouched; branch preserved."
+                    )
                     say(f"log: {log_path}")
                 say("--- last 50 lines ---")
                 say(log_tail(log_path, 50))
@@ -1498,19 +1545,25 @@ def cmd_submit(args) -> int:
                 if remote_exists(repo.canonical):
                     publish(repo, C)
                 set_last_green(repo, C)
-                journal(repo, "deploy_deferred", candidate=C, branch=branch, queued=queued)
+                journal(
+                    repo, "deploy_deferred", candidate=C, branch=branch, queued=queued
+                )
                 say("")
                 say("GATE PASSED (deploy deferred)")
                 say(f"  branch   : {branch}")
                 say(f"  merged   : {short(repo.canonical, C)}")
                 say(f"  deployed : deferred — {queued} submission(s) still queued")
                 say(f"  log      : {log_path}")
-                say(f"  next     : greenline done   # from {their_wt or 'your worktree'}")
+                say(
+                    f"  next     : greenline done   # from {their_wt or 'your worktree'}"
+                )
                 return 0
             say("deploying to prod ...")
             drc = deploy_now(repo, C, log_path)
             if drc != 0:
-                say(f"DEPLOY FAILED (exit {drc}) — rolling back to {short(repo.canonical, M)}")
+                say(
+                    f"DEPLOY FAILED (exit {drc}) — rolling back to {short(repo.canonical, M)}"
+                )
                 git(repo.canonical, "checkout", main, check=False)
                 with allow_main_updates(repo):
                     git(repo.canonical, "reset", "--hard", M)
@@ -1582,8 +1635,12 @@ def cmd_adopt(args) -> int:
 
             ensure_gate_worktree(repo)
             journal(
-                repo, "start", adopt=True, branch="adopt",
-                candidate=tip, pre_main=last_green,
+                repo,
+                "start",
+                adopt=True,
+                branch="adopt",
+                candidate=tip,
+                pre_main=last_green,
             )
 
             # check at the main tip in the gate worktree
@@ -1592,7 +1649,11 @@ def cmd_adopt(args) -> int:
             rc, timed_out = run_gate_check(repo, repo.gate_path, log_path)
             if rc != 0 or timed_out:
                 journal(
-                    repo, "adopt_failed", stage="check", candidate=tip, rc=rc,
+                    repo,
+                    "adopt_failed",
+                    stage="check",
+                    candidate=tip,
+                    rc=rc,
                     **({"reason": CHECK_TIMEOUT_REASON} if timed_out else {}),
                 )
                 if timed_out:
@@ -1601,8 +1662,10 @@ def cmd_adopt(args) -> int:
                 else:
                     say(f"CHECK FAILED (exit {rc}). main untouched; prod untouched.")
                     say(f"log: {log_path}")
-                say("Fix the code on main (or revert the offending commits), then re-run"
-                    " greenline adopt.")
+                say(
+                    "Fix the code on main (or revert the offending commits), then re-run"
+                    " greenline adopt."
+                )
                 say(log_tail(log_path, 50))
                 return 1
             journal(repo, "checked", candidate=tip)
@@ -1619,8 +1682,10 @@ def cmd_adopt(args) -> int:
                     (s for s in (deployed, last_green) if s and s != tip), None
                 )
                 if restore:
-                    say(f"DEPLOY FAILED (exit {drc}) — restoring prod to last-green"
-                        " (main is NOT reset; those commits are preserved).")
+                    say(
+                        f"DEPLOY FAILED (exit {drc}) — restoring prod to last-green"
+                        " (main is NOT reset; those commits are preserved)."
+                    )
                     redeploy_detached(repo, restore, log_path)
                     write_deployed(repo, restore)
                     journal(repo, "adopt_failed", stage="deploy", candidate=tip, rc=drc)
@@ -1631,7 +1696,11 @@ def cmd_adopt(args) -> int:
                     # re-run the same failing command on the same tree.
                     say(f"DEPLOY FAILED (exit {drc}).")
                     journal(
-                        repo, "adopt_failed", stage="deploy", candidate=tip, rc=drc,
+                        repo,
+                        "adopt_failed",
+                        stage="deploy",
+                        candidate=tip,
+                        rc=drc,
                         bootstrap=True,
                     )
                     prod_unknown_banner(repo, tip)
@@ -1680,13 +1749,22 @@ def cmd_done(args) -> int:
     if last_green:
         # squash-merge breaks ancestry; verify the branch's net diff is in last-green
         files = git_out(
-            repo.canonical, "diff", "--name-only",
-            git_out(repo.canonical, "merge-base", branch, last_green), branch,
+            repo.canonical,
+            "diff",
+            "--name-only",
+            git_out(repo.canonical, "merge-base", branch, last_green),
+            branch,
         )
         if files.strip():
             dp = git(
-                repo.canonical, "diff", "--quiet", branch, last_green, "--",
-                *files.split("\n"), check=False,
+                repo.canonical,
+                "diff",
+                "--quiet",
+                branch,
+                last_green,
+                "--",
+                *files.split("\n"),
+                check=False,
             )
             verified = dp.returncode == 0
     if not verified and not args.force:
@@ -1696,7 +1774,9 @@ def cmd_done(args) -> int:
             1,
         )
 
-    git(repo.canonical, "worktree", "remove", "--force" if args.force else "--", str(wt))
+    git(
+        repo.canonical, "worktree", "remove", "--force" if args.force else "--", str(wt)
+    )
     git(repo.canonical, "branch", "-D", branch)
     say(f"removed worktree {wt} and branch {branch}")
     return 0
@@ -1769,7 +1849,9 @@ def cmd_status(args) -> int:
         verdict = "OK"
     else:
         verdict = "DRIFT"
-    say(f"shas     : main={main_sha} origin={origin_s} last-green={lg} deployed={dep_s}  [{verdict}]")
+    say(
+        f"shas     : main={main_sha} origin={origin_s} last-green={lg} deployed={dep_s}  [{verdict}]"
+    )
     if pending:
         queued = waiters_queued(repo)
         say(
@@ -1814,21 +1896,28 @@ def _doctor_report(repo: Repo) -> bool:
     main_sha = rev(canon, main)
     lg = rev(canon, LAST_GREEN_REF)
     dep = read_deployed(repo)
-    check("main == last-green", bool(main_sha) and main_sha == lg,
-          f"main={short(canon, main)} lg={short(canon, LAST_GREEN_REF)}")
+    check(
+        "main == last-green",
+        bool(main_sha) and main_sha == lg,
+        f"main={short(canon, main)} lg={short(canon, LAST_GREEN_REF)}",
+    )
     pending = read_pending_deploy(repo)
     if pending:
         # A coalesced deploy is a deliberate, recorded state, not a fault. It
         # stops being acceptable only once nothing is queued to finish it.
         queued = waiters_queued(repo)
         check(
-            "deferred deploy has an owner", queued > 0,
+            "deferred deploy has an owner",
+            queued > 0,
             f"main={short(canon, main)} deployed={short(canon, dep) if dep else '-'};"
             f" nothing queued — run `greenline deploy-pending`",
         )
     elif dep:
-        check("main == deployed", main_sha == dep,
-              f"main={short(canon, main)} deployed={short(canon, dep)}")
+        check(
+            "main == deployed",
+            main_sha == dep,
+            f"main={short(canon, main)} deployed={short(canon, dep)}",
+        )
     gate_ok = repo.gate_path.exists() and is_git_repo(repo.gate_path)
     check("gate worktree healthy", gate_ok, str(repo.gate_path))
     hooks_dir = repo.common_dir / "hooks"
@@ -1865,7 +1954,9 @@ def cmd_doctor(args) -> int:
 # --------------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="greenline", description=__doc__.splitlines()[0])
-    p.add_argument("-v", "--verbose", action="store_true", help="verbose git/command output")
+    p.add_argument(
+        "-v", "--verbose", action="store_true", help="verbose git/command output"
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def add_repo(sp):
@@ -1873,7 +1964,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("setup", help="set this repo up with greenline")
     sp.add_argument(
-        "--refresh-docs", action="store_true",
+        "--refresh-docs",
+        action="store_true",
         help="re-render AGENTS section + docs from templates (overwrites repo customizations)",
     )
     add_repo(sp)
@@ -1933,5 +2025,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    signal.signal(signal.SIGPIPE, signal.SIG_DFL) if hasattr(signal, "SIGPIPE") else None
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL) if hasattr(
+        signal, "SIGPIPE"
+    ) else None
     sys.exit(main())

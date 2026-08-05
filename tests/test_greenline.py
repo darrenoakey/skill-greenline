@@ -5,6 +5,7 @@ script, points greenline's worktree_base into the tmp dir, and drives the CLI as
 a subprocess (the way a user/agent would) so the flock serialization and hooks
 are exercised for real.
 """
+
 from __future__ import annotations
 
 import json
@@ -26,7 +27,9 @@ GREENLINE = str(Path(__file__).resolve().parent.parent / "greenline")
 def run_git(cwd, *args):
     return subprocess.run(
         ["git", "-C", str(cwd), *args],
-        capture_output=True, text=True, check=True,
+        capture_output=True,
+        text=True,
+        check=True,
     ).stdout.strip()
 
 
@@ -34,7 +37,10 @@ def gl(cwd, *args, expect=None, env=None):
     """Invoke the greenline CLI as a subprocess."""
     proc = subprocess.run(
         [sys.executable, GREENLINE, *args],
-        cwd=str(cwd), capture_output=True, text=True, env=env,
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        env=env,
     )
     if expect is not None:
         assert proc.returncode == expect, (
@@ -51,7 +57,9 @@ def write_run_script(repo: Path, body: str):
     script.chmod(0o755)
 
 
-def make_repo(tmp_path: Path, name: str, run_body: str, with_origin: bool = False) -> Path:
+def make_repo(
+    tmp_path: Path, name: str, run_body: str, with_origin: bool = False
+) -> Path:
     """Create a scratch git repo with a ./run script and one initial commit."""
     repo = tmp_path / name
     repo.mkdir()
@@ -221,6 +229,37 @@ def setup_repo(tmp_path: Path, name="proj", with_origin=False, coalesce=False) -
     return repo
 
 
+def test_load_repo_uses_worktree_config_during_first_bootstrap(tmp_path):
+    """A bootstrap branch can define the real default branch before merge."""
+    repo = tmp_path / "bootstrap-master"
+    repo.mkdir()
+    run_git(repo, "init", "-q", "-b", "master")
+    run_git(repo, "config", "user.email", "t@t.t")
+    run_git(repo, "config", "user.name", "t")
+    write_run_script(repo, RUN_RECORDER)
+    (repo / "app.txt").write_text("v0\n")
+    run_git(repo, "add", "-A")
+    run_git(repo, "commit", "-q", "-m", "initial")
+
+    worktree = tmp_path / "bootstrap-worktree"
+    run_git(repo, "worktree", "add", "-q", "-b", "bootstrap", str(worktree))
+    gate_base = tmp_path / "bootstrap-gates"
+    (worktree / "greenline.toml").write_text(
+        "contract_version = 1\n"
+        'main_branch = "master"\n'
+        'check = "./run check"\n'
+        'deploy = "./run deploy"\n'
+        f'worktree_base = "{gate_base}"\n'
+    )
+
+    module = load_greenline_module()
+    loaded = module.load_repo(worktree)
+
+    assert loaded.canonical == repo.resolve()
+    assert loaded.main_branch == "master"
+    assert loaded.gate_path == gate_base / "gate"
+
+
 def make_worktree(repo: Path, name: str) -> Path:
     proc = gl(repo, "worktree", name, expect=0)
     path = Path(proc.stdout.strip().splitlines()[-1])
@@ -241,7 +280,15 @@ def test_submit_force_updates_persistent_gate_submodule_to_candidate_gitlink(tmp
     repo = setup_repo(tmp_path, "submodules")
     run_git(repo, "config", "protocol.file.allow", "always")
     with with_main_unlocked(repo):
-        run_git(repo, "-c", "protocol.file.allow=always", "submodule", "add", str(module), "module")
+        run_git(
+            repo,
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            str(module),
+            "module",
+        )
         run_git(repo, "commit", "-q", "-m", "add module")
     run_git(repo, "update-ref", "refs/greenline/last-green", "main")
 
@@ -315,7 +362,9 @@ def test_setup_commits_its_own_scaffolding(tmp_path):
 
     # scaffolding is committed; only the unrelated file is still dirty
     assert run_git(repo, "status", "--porcelain") == "?? unrelated.txt"
-    assert run_git(repo, "log", "-1", "--format=%s", "main") == "Add greenline gate config"
+    assert (
+        run_git(repo, "log", "-1", "--format=%s", "main") == "Add greenline gate config"
+    )
     committed = run_git(repo, "show", "--name-only", "--format=", "main").split()
     assert sorted(committed) == sorted(
         ["AGENTS.md", "docs/DOCTRINE.md", "docs/greenline.md", "greenline.toml"]
@@ -336,7 +385,8 @@ def test_setup_commits_its_own_scaffolding(tmp_path):
     run_git(repo, "add", "-A")
     blocked = subprocess.run(
         ["git", "-C", str(repo), "commit", "--no-verify", "-m", "direct"],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
     assert blocked.returncode != 0
     assert "greenline" in (blocked.stdout + blocked.stderr).lower()
@@ -503,9 +553,7 @@ def test_empty_candidate_refused(tmp_path):
 def test_serialization_second_blocks_until_first_done(tmp_path):
     repo = setup_repo(tmp_path)
     # slow check so the first holder keeps the lock for a beat
-    slow_body = RUN_RECORDER.replace(
-        "check)\n", "check)\n        sleep 2\n", 1
-    )
+    slow_body = RUN_RECORDER.replace("check)\n", "check)\n        sleep 2\n", 1)
     write_run_script(repo, slow_body)
     with with_main_unlocked(repo):
         run_git(repo, "add", "-A")
@@ -520,12 +568,18 @@ def test_serialization_second_blocks_until_first_done(tmp_path):
     env = os.environ.copy()
     p1 = subprocess.Popen(
         [sys.executable, GREENLINE, "submit", "--repo", str(wt1)],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=env,
     )
     time.sleep(0.6)  # let p1 grab the lock and enter slow check
     p2 = subprocess.Popen(
         [sys.executable, GREENLINE, "submit", "--repo", str(wt2)],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=env,
     )
     out1, _ = p1.communicate(timeout=120)
     out2, _ = p2.communicate(timeout=120)
@@ -563,7 +617,12 @@ def test_crash_recovery_ffed_but_not_deployed(tmp_path):
     jpath = common_dir(repo) / "greenline" / "journal.jsonl"
     with jpath.open("a") as fh:
         for ev in (
-            {"event": "start", "branch": C_branch, "candidate_src_sha": C, "pre_main": M},
+            {
+                "event": "start",
+                "branch": C_branch,
+                "candidate_src_sha": C,
+                "pre_main": M,
+            },
             {"event": "checked", "candidate": C},
             {"event": "ffed", "candidate": C, "pre_main": M},
         ):
@@ -595,7 +654,12 @@ def test_crash_recovery_ffed_and_deployed_completes(tmp_path):
     jpath = common_dir(repo) / "greenline" / "journal.jsonl"
     with jpath.open("a") as fh:
         for ev in (
-            {"event": "start", "branch": "gl/crash2", "candidate_src_sha": C, "pre_main": M},
+            {
+                "event": "start",
+                "branch": "gl/crash2",
+                "candidate_src_sha": C,
+                "pre_main": M,
+            },
             {"event": "checked", "candidate": C},
             {"event": "ffed", "candidate": C, "pre_main": M},
         ):
@@ -619,7 +683,8 @@ def test_pre_push_hook_blocks_direct_and_gate_push_succeeds(tmp_path):
         run_git(repo, "commit", "-q", "-m", "sneaky direct")
     proc = subprocess.run(
         ["git", "-C", str(repo), "push", "origin", "main"],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
     assert proc.returncode != 0
     assert "greenline" in proc.stderr
@@ -664,7 +729,8 @@ def test_done_removes_merged_worktree(tmp_path):
     # branch deleted
     r = subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "--verify", "refs/heads/gl/toremove"],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
     assert r.returncode != 0
 
@@ -819,7 +885,8 @@ def test_main_hard_lock_blocks_commit_and_no_verify(tmp_path):
     # soft layer: plain commit on main is refused by pre-commit
     soft = subprocess.run(
         ["git", "-C", str(repo), "commit", "-m", "blocked"],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
     assert soft.returncode != 0
     assert "greenline" in (soft.stdout + soft.stderr).lower()
@@ -828,7 +895,8 @@ def test_main_hard_lock_blocks_commit_and_no_verify(tmp_path):
     # hard layer: --no-verify still cannot move main
     hard = subprocess.run(
         ["git", "-C", str(repo), "commit", "--no-verify", "-m", "blocked hard"],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
     assert hard.returncode != 0
     assert "greenline" in (hard.stdout + hard.stderr).lower()
@@ -841,7 +909,8 @@ def test_main_hard_lock_blocks_commit_and_no_verify(tmp_path):
     allow.write_text("999999\n")
     stale = subprocess.run(
         ["git", "-C", str(repo), "commit", "--no-verify", "-m", "stale allow"],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
     assert stale.returncode != 0
     assert "greenline" in (stale.stdout + stale.stderr).lower()
@@ -890,10 +959,15 @@ def submit_burst(repo: Path, worktrees, env=None):
     env = env or os.environ.copy()
     procs = []
     for i, wt in enumerate(worktrees):
-        procs.append(subprocess.Popen(
-            [sys.executable, GREENLINE, "submit", "--repo", str(wt)],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
-        ))
+        procs.append(
+            subprocess.Popen(
+                [sys.executable, GREENLINE, "submit", "--repo", str(wt)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=env,
+            )
+        )
         # Let the first process take the lock before the rest start queueing,
         # so the queue is real rather than a race we hope lands the right way.
         time.sleep(1.2 if i == 0 else 0.3)
@@ -933,7 +1007,9 @@ def test_queued_submissions_coalesce_into_one_deploy(tmp_path):
     # ...but prod was restarted once, not three times.
     deploys = deploy_shas(repo)
     assert len(deploys) == 1, f"burst must collapse to ONE deploy, got {len(deploys)}"
-    assert deploys[0] == sha(repo, "main"), "the single deploy must ship the final main tip"
+    assert deploys[0] == sha(repo, "main"), (
+        "the single deploy must ship the final main tip"
+    )
 
     deferred = [e for e in journal_events(repo) if e["event"] == "deploy_deferred"]
     assert len(deferred) == 2, f"two deploys should have been deferred, got {deferred}"
@@ -1004,7 +1080,9 @@ def test_deploy_pending_command_ships_a_stranded_deploy(tmp_path):
     before = len(deploy_shas(repo))
 
     # Simulate the stranded state the killed process would have left behind.
-    (common_dir(repo) / "greenline" / "pending-deploy").write_text(sha(repo, "main") + "\n")
+    (common_dir(repo) / "greenline" / "pending-deploy").write_text(
+        sha(repo, "main") + "\n"
+    )
 
     proc = gl(repo, "status", expect=0)
     assert "DEPLOY DEFERRED" in proc.stdout, proc.stdout
@@ -1049,7 +1127,9 @@ def test_deploy_pending_publishes_what_it_deploys(tmp_path):
 
     assert deploy_shas(repo)[-1] == stranded, "prod must be at the stranded main"
     run_git(repo, "fetch", "-q", "origin")
-    assert sha(repo, "origin/main") == stranded, "deploy-pending must publish what it deployed"
+    assert sha(repo, "origin/main") == stranded, (
+        "deploy-pending must publish what it deployed"
+    )
     assert sha(repo, "refs/greenline/last-green") == stranded, (
         "last-green must follow prod, or a rollback would restore an older sha "
         "than the one running"
@@ -1139,7 +1219,11 @@ def test_default_worktree_base_falls_back_off_the_authors_volume(tmp_path, monke
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setattr(mod.Path, "home", staticmethod(lambda: home))
-    monkeypatch.setattr(mod.Path, "is_dir", lambda self: False if str(self) == "/Volumes/Gumby" else Path.is_dir(self))
+    monkeypatch.setattr(
+        mod.Path,
+        "is_dir",
+        lambda self: False if str(self) == "/Volumes/Gumby" else Path.is_dir(self),
+    )
 
     base = mod.default_worktree_base("proj")
     assert "/Volumes/Gumby" not in base
