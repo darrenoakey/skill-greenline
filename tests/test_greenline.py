@@ -1228,3 +1228,37 @@ def test_default_worktree_base_falls_back_off_the_authors_volume(tmp_path, monke
     base = mod.default_worktree_base("proj")
     assert "/Volumes/Gumby" not in base
     assert base == str(home / "greenline-worktrees" / "proj")
+
+
+def test_machine_config_worktree_base_outranks_the_committed_one(tmp_path, monkeypatch):
+    """A repo gated on a removable volume must be movable without a gate run.
+
+    greenline.toml is committed, so relocating a gate normally needs a merge —
+    which needs the very gate that macOS TCC has already broken with
+    `Operation not permitted`. The machine-local override is the only escape
+    from that deadlock, so it has to win over the committed value.
+    """
+    mod = load_greenline_module()
+
+    repo = make_repo(tmp_path, "proj", RUN_RECORDER)
+    seed_config(repo, tmp_path, "proj")
+    committed = tmp_path / "wt" / "proj"
+
+    home = tmp_path / "home"
+    cfg_dir = home / ".config" / "greenline"
+    cfg_dir.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+
+    # no machine config -> greenline.toml is authoritative
+    assert mod.machine_config_path() == cfg_dir / "config.toml"
+    assert mod.load_repo(repo).worktree_base == committed
+
+    # named repo -> override wins, and ~ expands against the same home
+    (cfg_dir / "config.toml").write_text('[worktree_base]\nproj = "~/internal/proj"\n')
+    loaded = mod.load_repo(repo)
+    assert loaded.worktree_base == home / "internal" / "proj"
+    assert loaded.gate_path == home / "internal" / "proj" / "gate"
+
+    # a repo the override does not name keeps its committed base
+    (cfg_dir / "config.toml").write_text('[worktree_base]\nother = "/tmp/other"\n')
+    assert mod.load_repo(repo).worktree_base == committed

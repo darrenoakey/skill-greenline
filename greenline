@@ -288,14 +288,54 @@ class Repo:
         self.waiters_dir.mkdir(parents=True, exist_ok=True)
 
 
+def machine_config_path() -> Path:
+    """Machine-local greenline config. Resolved per call so HOME can move."""
+    return Path.home() / ".config" / "greenline" / "config.toml"
+
+
+def machine_worktree_base(reponame: str) -> str | None:
+    """Machine-local worktree location, keyed by canonical repo directory name.
+
+    Where worktrees live is a property of the MACHINE, not of the repository,
+    and it is not always a free choice. On macOS every executable that touches
+    a USB/Thunderbolt volume needs its own TCC "removable volume" consent,
+    keyed to that binary's identity. Go/Rust/Swift test binaries are rebuilt
+    under a fresh random path on every run, so their consent can never be
+    reused: the prompts never stop, and once one is refused the gate fails with
+    a bare `Operation not permitted`. Such a repo has to be gated on internal
+    storage even though its committed greenline.toml says otherwise -- and it
+    cannot fix that by landing a commit, because landing a commit needs the
+    very gate that is broken. So this override outranks greenline.toml:
+
+        # ~/.config/greenline/config.toml   (machine-local, never committed)
+        [worktree_base]
+        agentd3 = "~/greenline-worktrees/agentd3"
+
+    Missing file or missing key -> None, and greenline.toml stays authoritative.
+    """
+    path = machine_config_path()
+    try:
+        with path.open("rb") as fh:
+            table = tomllib.load(fh).get("worktree_base", {})
+    except FileNotFoundError:
+        return None
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        die(f"machine config {path} is unreadable: {exc}", 2)
+    if not isinstance(table, dict):
+        die(f"machine config {path}: [worktree_base] must be a table", 2)
+    value = table.get(reponame)
+    return str(value) if value else None
+
+
 def default_worktree_base(reponame: str) -> str:
     """Where a repo's greenline worktrees live when greenline.toml omits it.
 
     Prefers a large scratch volume when one is mounted (worktrees are full
     checkouts and multiply fast), and otherwise falls back to the home
     directory — so the tool works on a machine that has never heard of this
-    author's external drive. An explicit worktree_base in greenline.toml always
-    wins over both.
+    author's external drive. A machine-local override in
+    ~/.config/greenline/config.toml wins over both, and an explicit
+    worktree_base in greenline.toml wins over this default.
     """
     scratch = Path("/Volumes/Gumby")
     if scratch.is_dir():
@@ -324,7 +364,10 @@ def load_repo(start: str | Path | None) -> Repo:
     if cfg_path.exists():
         with cfg_path.open("rb") as fh:
             config = tomllib.load(fh)
-    if "worktree_base" not in config:
+    override = machine_worktree_base(canon.name)
+    if override:
+        config["worktree_base"] = override
+    elif "worktree_base" not in config:
         config["worktree_base"] = default_worktree_base(canon.name)
     return Repo(canonical=canon, common_dir=common, config=config)
 
