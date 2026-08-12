@@ -87,13 +87,17 @@ the tests themselves are designed **together** to survive this environment:
   summary constraint that all the above serve. If two agents cannot both run
   `./run check` at the same moment without interfering, the check is broken.
 
-## The five-minute check
+## The check time budget
 
-**`check` must finish in under five minutes. Over that, the gate kills it and
-fails the submission** — same verdict as a red test, and the whole process group
-dies with it. This is a hard limit: there is no config knob, and there is no
-repo whose suite is "just legitimately slow". A gate nobody can afford to wait
-for is a gate that gets bypassed.
+**Five minutes is the soft `check` budget; ten minutes is the hard timeout.** A
+successful check at or below five minutes passes normally. A successful check
+after five but within ten minutes also passes; after deploy, publish, and
+`last-green` are complete and the gate lock is released, Greenline invokes
+`agentd3 task enqueue-slow-gate` with the canonical repo, candidate SHA, and
+monotonic duration. That feedback is best-effort: failure is loud and journaled
+but never makes a healthy candidate red. Beyond ten minutes, Greenline kills the
+whole process group and fails the submission without creating a task. Neither
+threshold has a config knob.
 
 The remedy is never raising the limit. It is making the suite fast:
 

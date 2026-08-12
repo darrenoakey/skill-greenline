@@ -132,8 +132,8 @@ def load_greenline_module():
     """Import the CLI script as a module (it has no .py suffix).
 
     Lets a test patch module constants and call main() in-process — the only
-    way to exercise CHECK_TIMEOUT_SECONDS without waiting five real minutes,
-    since the cap is deliberately not configurable from outside.
+    way to exercise the fixed timing budgets without waiting real minutes,
+    since they are deliberately not configurable from outside.
     """
     import importlib.machinery
     import importlib.util
@@ -177,6 +177,36 @@ def journal_events(repo: Path):
     if not j.exists():
         return []
     return [json.loads(ln) for ln in j.read_text().splitlines() if ln.strip()]
+
+
+def install_agentd3(tmp_path: Path, record: Path, exit_code: int = 0) -> Path:
+    """Install a recorder CLI that also proves completion and lock release."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    cli = bindir / "agentd3"
+    cli.write_text(
+        "#!/usr/bin/env python3\n"
+        "import fcntl, json, subprocess, sys\n"
+        "repo = sys.argv[sys.argv.index('--repo') + 1]\n"
+        "common = subprocess.run(['git', '-C', repo, 'rev-parse', "
+        "'--path-format=absolute', '--git-common-dir'], check=True, "
+        "capture_output=True, text=True).stdout.strip()\n"
+        "journal = common + '/greenline/journal.jsonl'\n"
+        "events = [json.loads(line)['event'] for line in open(journal)]\n"
+        "lock = open(common + '/greenline/lock', 'w')\n"
+        "unlocked = True\n"
+        "try:\n"
+        "    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+        "except OSError:\n"
+        "    unlocked = False\n"
+        "payload = {'argv': sys.argv[1:], "
+        "'complete_before_call': events[-1] == 'complete', "
+        "'lock_released': unlocked}\n"
+        f"open({str(record)!r}, 'w').write(json.dumps(payload))\n"
+        f"raise SystemExit({exit_code})\n"
+    )
+    cli.chmod(0o755)
+    return bindir
 
 
 def sha(repo: Path, ref: str) -> str:
@@ -1138,19 +1168,106 @@ def test_deploy_pending_publishes_what_it_deploys(tmp_path):
 
 
 # --------------------------------------------------------------------------
-# the five-minute check cap (doctrine)
+# check timing contract
 # --------------------------------------------------------------------------
-# The check pipeline must finish in under 5 minutes; longer is automatically a
-# gate FAIL. There is no config override, so these tests patch the constant in
-# an in-process import of the CLI rather than waiting for the real cap.
+# Five minutes is a soft optimization budget and ten is the hard timeout. There
+# is no user-facing override, so tests patch module constants in process.
 
 
-def test_check_timeout_default_is_five_minutes():
+def test_check_timing_defaults_are_five_soft_ten_hard_minutes():
     mod = load_greenline_module()
-    assert mod.CHECK_TIMEOUT_SECONDS == 300
+    assert mod.CHECK_SOFT_BUDGET_SECONDS == 300
+    assert mod.CHECK_HARD_TIMEOUT_SECONDS == 600
 
 
-def test_check_timeout_fails_the_gate_and_reaps_children(tmp_path, capsys):
+def test_check_within_soft_budget_creates_no_task(tmp_path, capsys, monkeypatch):
+    repo = setup_repo(tmp_path, "fastcheck")
+    wt = make_worktree(repo, "fast")
+    commit_in(wt, "fast.txt", "fast\n", "fast check")
+    record = tmp_path / "agentd3.json"
+    bindir = install_agentd3(tmp_path, record)
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+
+    mod = load_greenline_module()
+    mod.CHECK_SOFT_BUDGET_SECONDS = 60
+    mod.CHECK_HARD_TIMEOUT_SECONDS = 61
+    assert mod.main(["submit", "--repo", str(wt)]) == 0
+    capsys.readouterr()
+
+    assert not record.exists()
+    assert not [e for e in journal_events(repo) if e["event"] == "gate_slow"]
+
+
+def test_slow_submit_notifies_once_after_completion_and_unlock(
+    tmp_path, capsys, monkeypatch
+):
+    repo = setup_repo(tmp_path, "slowsuccess")
+    wt = make_worktree(repo, "slow")
+    commit_in(wt, "slow.txt", "slow\n", "slow successful check")
+    record = tmp_path / "agentd3.json"
+    bindir = install_agentd3(tmp_path, record)
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+
+    mod = load_greenline_module()
+    mod.CHECK_SOFT_BUDGET_SECONDS = 0
+    mod.CHECK_HARD_TIMEOUT_SECONDS = 10
+    assert mod.main(["submit", "--repo", str(wt)]) == 0
+    out = capsys.readouterr().out
+
+    calls = json.loads(record.read_text())
+    slow = [e for e in journal_events(repo) if e["event"] == "gate_slow"]
+    assert len(slow) == 1
+    event = slow[0]
+    expected_seconds = format(event["seconds"], ".6f").rstrip("0").rstrip(".")
+    assert calls == {
+        "argv": [
+            "task",
+            "enqueue-slow-gate",
+            "--repo",
+            str(repo.resolve()),
+            "--gate-sha",
+            sha(repo, "main"),
+            "--seconds",
+            expected_seconds,
+        ],
+        "complete_before_call": True,
+        "lock_released": True,
+    }
+    assert event["enqueue_outcome"] == "enqueued"
+    assert "SOFT CHECK BUDGET EXCEEDED" in out
+    assert journal_events(repo)[-2]["event"] == "complete"
+    status = gl(repo, "status", expect=0)
+    assert "gate_slow" in status.stdout
+    latest_log = sorted((common_dir(repo) / "greenline" / "logs").glob("*.log"))[-1]
+    assert "SOFT CHECK BUDGET EXCEEDED" in latest_log.read_text()
+
+
+def test_slow_notification_failure_keeps_submit_green(
+    tmp_path, capsys, monkeypatch
+):
+    repo = setup_repo(tmp_path, "notifyfail")
+    wt = make_worktree(repo, "slow")
+    commit_in(wt, "slow.txt", "slow\n", "slow successful check")
+    record = tmp_path / "agentd3.json"
+    bindir = install_agentd3(tmp_path, record, exit_code=7)
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+
+    mod = load_greenline_module()
+    mod.CHECK_SOFT_BUDGET_SECONDS = 0
+    mod.CHECK_HARD_TIMEOUT_SECONDS = 10
+    assert mod.main(["submit", "--repo", str(wt)]) == 0
+    captured = capsys.readouterr()
+
+    assert sha(repo, "main") == sha(repo, "refs/greenline/last-green")
+    slow = [e for e in journal_events(repo) if e["event"] == "gate_slow"]
+    assert len(slow) == 1 and slow[0]["enqueue_outcome"] == "failed"
+    assert slow[0]["rc"] == 7
+    assert "Gate remains green" in captured.err
+
+
+def test_check_timeout_fails_the_gate_and_reaps_children(
+    tmp_path, capsys, monkeypatch
+):
     repo = setup_repo(tmp_path, "slowcheck")
     main_before = sha(repo, "main")
     lg_before = sha(repo, "refs/greenline/last-green")
@@ -1158,14 +1275,18 @@ def test_check_timeout_fails_the_gate_and_reaps_children(tmp_path, capsys):
     write_run_script(wt, SLOW_CHECK)
     run_git(wt, "add", "-A")
     run_git(wt, "commit", "-q", "-m", "slow check")
+    notification = tmp_path / "agentd3.json"
+    bindir = install_agentd3(tmp_path, notification)
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
 
     mod = load_greenline_module()
-    mod.CHECK_TIMEOUT_SECONDS = 2
+    mod.CHECK_SOFT_BUDGET_SECONDS = 0
+    mod.CHECK_HARD_TIMEOUT_SECONDS = 2
     rc = mod.main(["submit", "--repo", str(wt)])
     out = capsys.readouterr().out
     assert rc == 1
     assert "CHECK TIMED OUT" in out
-    assert "5 minutes" in out and "DOCTRINE.md" in out
+    assert "10-minute hard" in out and "DOCTRINE.md" in out
 
     # the check's grandchild (a bare `sleep`) must have been reaped with the group
     child = int((common_dir(repo) / "slow-child.pid").read_text().strip())
@@ -1181,6 +1302,8 @@ def test_check_timeout_fails_the_gate_and_reaps_children(tmp_path, capsys):
     last = journal_events(repo)[-1]
     assert last["event"] == "fail" and last["stage"] == "check"
     assert last["reason"] == mod.CHECK_TIMEOUT_REASON
+    assert not [e for e in journal_events(repo) if e["event"] == "gate_slow"]
+    assert not notification.exists()
 
 
 def test_adopt_check_timeout_is_a_failure_too(tmp_path, capsys):
@@ -1193,7 +1316,8 @@ def test_adopt_check_timeout_is_a_failure_too(tmp_path, capsys):
     tip = sha(repo, "main")
 
     mod = load_greenline_module()
-    mod.CHECK_TIMEOUT_SECONDS = 2
+    mod.CHECK_SOFT_BUDGET_SECONDS = 0
+    mod.CHECK_HARD_TIMEOUT_SECONDS = 2
     rc = mod.main(["adopt", "--repo", str(repo)])
     out = capsys.readouterr().out
     assert rc == 1
@@ -1206,6 +1330,37 @@ def test_adopt_check_timeout_is_a_failure_too(tmp_path, capsys):
     last = journal_events(repo)[-1]
     assert last["event"] == "adopt_failed" and last["stage"] == "check"
     assert last["reason"] == mod.CHECK_TIMEOUT_REASON
+
+
+def test_slow_adopt_notifies_after_success(tmp_path, capsys, monkeypatch):
+    repo = setup_repo(tmp_path, "slowadoptsuccess")
+    with with_main_unlocked(repo):
+        (repo / "adopt.txt").write_text("adopt\n")
+        run_git(repo, "add", "adopt.txt")
+        run_git(repo, "commit", "-q", "-m", "out of gate change")
+    tip = sha(repo, "main")
+    record = tmp_path / "agentd3.json"
+    bindir = install_agentd3(tmp_path, record)
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+
+    mod = load_greenline_module()
+    mod.CHECK_SOFT_BUDGET_SECONDS = 0
+    mod.CHECK_HARD_TIMEOUT_SECONDS = 10
+    assert mod.main(["adopt", "--repo", str(repo)]) == 0
+    capsys.readouterr()
+
+    call = json.loads(record.read_text())
+    assert call["argv"][:6] == [
+        "task",
+        "enqueue-slow-gate",
+        "--repo",
+        str(repo.resolve()),
+        "--gate-sha",
+        tip,
+    ]
+    assert call["complete_before_call"] and call["lock_released"]
+    slow = [e for e in journal_events(repo) if e["event"] == "gate_slow"]
+    assert len(slow) == 1 and slow[0]["branch"] == "adopt"
 
 
 # --------------------------------------------------------------------------

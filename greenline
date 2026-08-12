@@ -33,11 +33,14 @@ MD_BEGIN = "<!-- >>> greenline >>> -->"
 MD_END = "<!-- <<< greenline <<< -->"
 LAST_GREEN_REF = "refs/greenline/last-green"
 
-# Doctrine: the check pipeline must finish in under five minutes. A longer run
-# is automatically a gate FAIL. Deliberately NOT configurable — a repo whose
-# check outgrows this makes the suite faster, it does not raise the cap.
-CHECK_TIMEOUT_SECONDS = 300
-CHECK_TIMEOUT_REASON = "check exceeded the 5-minute doctrine cap"
+# Five minutes is the optimization budget; ten minutes is the hard correctness
+# deadline. Deliberately not user-configurable. Tests patch these module values
+# to exercise both boundaries without sleeping for real minutes.
+CHECK_SOFT_BUDGET_SECONDS = 300
+CHECK_HARD_TIMEOUT_SECONDS = 600
+CHECK_TIMEOUT_REASON = "check exceeded the 10-minute hard timeout"
+SLOW_GATE_ENQUEUE_TIMEOUT_SECONDS = 15
+SLOW_GATE_OUTPUT_LIMIT_BYTES = 4096
 
 SKILL_DIR = Path(__file__).resolve().parent
 TEMPLATE_DIR = SKILL_DIR / "templates"
@@ -381,6 +384,7 @@ class GateLock:
     def __init__(self, repo: Repo):
         self.repo = repo
         self.fh = None
+        self.slow_gate: dict | None = None
 
     def __enter__(self):
         self.repo.ensure_state()
@@ -452,11 +456,30 @@ class GateLock:
         with contextlib.suppress(FileNotFoundError):
             self.repo.status_path.unlink()
 
+    def enqueue_slow_gate_after_release(
+        self, branch: str, candidate: str, seconds: float, log_path: Path
+    ) -> None:
+        """Remember a successful slow gate for best-effort post-lock feedback."""
+        self.slow_gate = {
+            "branch": branch,
+            "candidate": candidate,
+            "seconds": seconds,
+            "log_path": log_path,
+        }
+
     def __exit__(self, *exc):
         if self.fh:
             with contextlib.suppress(Exception):
                 fcntl.flock(self.fh, fcntl.LOCK_UN)
             self.fh.close()
+        if self.slow_gate is not None:
+            try:
+                report_slow_gate(self.repo, **self.slow_gate)
+            except Exception as report_exc:  # noqa: BLE001
+                warn(
+                    "slow-gate feedback reporting failed "
+                    f"({type(report_exc).__name__}); gate remains green"
+                )
         return False
 
 
@@ -662,31 +685,138 @@ def run_shell(cmd: str, cwd: Path, log_path: Path, timeout: float | None = None)
     return rc
 
 
-def run_gate_check(repo: Repo, cwd: Path, log_path: Path) -> tuple[int, bool]:
-    """Run the repo's check under the hard doctrine time cap.
+def run_gate_check(repo: Repo, cwd: Path, log_path: Path) -> tuple[int, bool, float]:
+    """Run the repo's check under the hard correctness time cap.
 
-    Returns (exit code, timed_out). A timed-out check is a gate FAIL exactly
-    like a red test — see check_timeout_banner().
+    Returns (exit code, timed_out, monotonic elapsed seconds). Crossing the
+    soft budget is handled only after the whole gate succeeds.
     """
-    return run_shell_timed(repo.check_cmd, cwd, log_path, CHECK_TIMEOUT_SECONDS)
+    started = time.monotonic()
+    rc, timed_out = run_shell_timed(
+        repo.check_cmd, cwd, log_path, CHECK_HARD_TIMEOUT_SECONDS
+    )
+    return rc, timed_out, time.monotonic() - started
 
 
 def check_timeout_banner(log_path: Path) -> None:
-    mins = CHECK_TIMEOUT_SECONDS / 60
+    mins = CHECK_HARD_TIMEOUT_SECONDS / 60
     say("")
     say("=" * 60)
     say(
-        f"CHECK TIMED OUT after {CHECK_TIMEOUT_SECONDS:.0f}s "
+        f"CHECK TIMED OUT after {CHECK_HARD_TIMEOUT_SECONDS:.0f}s "
         f"({mins:g} min) — GATE FAILED."
     )
-    say("The check pipeline must finish in under 5 minutes. This is a hard")
-    say("doctrine limit: there is no config override, and the remedy is never")
-    say("raising it — it is making the suite fast (parallelize with isolated")
+    say("The check pipeline has a 5-minute soft budget and a 10-minute hard")
+    say("timeout. There is no config override; make the suite faster (parallelize")
+    say("with isolated")
     say("namespaces, start from prebuilt fixtures, warm caches, fail fast on")
     say("build/lint before the slow suites, split monolithic integration tests).")
-    say("Playbook: docs/DOCTRINE.md -> 'The five-minute check'.")
+    say("Playbook: docs/DOCTRINE.md -> 'The check time budget'.")
     say("=" * 60)
     say(f"log: {log_path}")
+
+
+def _bounded_pipe_reader(pipe, limit: int, chunks: list[bytes]) -> None:
+    """Drain a child pipe while retaining only a bounded diagnostic prefix."""
+    while True:
+        data = pipe.read(1024)
+        if not data:
+            return
+        remaining = limit - sum(len(chunk) for chunk in chunks)
+        if remaining > 0:
+            chunks.append(data[:remaining])
+
+
+def safe_agent_environment() -> dict[str, str]:
+    """Pass only standard OS process context, never secret/config variables."""
+    allowed = ("HOME", "PATH", "USER", "LANG", "LC_ALL", "TMPDIR")
+    return {name: os.environ[name] for name in allowed if name in os.environ}
+
+
+def enqueue_slow_gate(repo: Repo, candidate: str, seconds: float) -> dict:
+    """Best-effort AgentD3 feedback call with bounded time and captured output."""
+    argv = [
+        "agentd3",
+        "task",
+        "enqueue-slow-gate",
+        "--repo",
+        str(repo.canonical),
+        "--gate-sha",
+        candidate,
+        "--seconds",
+        format(seconds, ".6f").rstrip("0").rstrip("."),
+    ]
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+            env=safe_agent_environment(),
+        )
+    except OSError as exc:
+        return {"outcome": "unavailable", "error": type(exc).__name__}
+    stdout: list[bytes] = []
+    stderr: list[bytes] = []
+    readers = [
+        threading.Thread(
+            target=_bounded_pipe_reader,
+            args=(proc.stdout, SLOW_GATE_OUTPUT_LIMIT_BYTES, stdout),
+            daemon=True,
+        ),
+        threading.Thread(
+            target=_bounded_pipe_reader,
+            args=(proc.stderr, SLOW_GATE_OUTPUT_LIMIT_BYTES, stderr),
+            daemon=True,
+        ),
+    ]
+    for reader in readers:
+        reader.start()
+    try:
+        proc.wait(timeout=SLOW_GATE_ENQUEUE_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        _kill_process_group(proc)
+        outcome = {"outcome": "timeout"}
+    else:
+        outcome = (
+            {"outcome": "enqueued"}
+            if proc.returncode == 0
+            else {"outcome": "failed", "rc": proc.returncode}
+        )
+    for reader in readers:
+        reader.join(timeout=1)
+    # Output is deliberately captured and discarded: it may contain secrets.
+    outcome["captured_bytes"] = len(b"".join(stdout)) + len(b"".join(stderr))
+    return outcome
+
+
+def report_slow_gate(
+    repo: Repo, branch: str, candidate: str, seconds: float, log_path: Path
+) -> None:
+    """Journal and display a successful soft-budget breach after lock release."""
+    try:
+        outcome = enqueue_slow_gate(repo, candidate, seconds)
+    except Exception as exc:  # noqa: BLE001 - feedback must never redden a gate
+        outcome = {"outcome": "error", "error": type(exc).__name__}
+    fields = {
+        "branch": branch,
+        "candidate": candidate,
+        "seconds": round(seconds, 6),
+        "enqueue_outcome": outcome["outcome"],
+        **{key: value for key, value in outcome.items() if key != "outcome"},
+    }
+    journal(repo, "gate_slow", **fields)
+    message = (
+        f"SOFT CHECK BUDGET EXCEEDED: {seconds:.3f}s "
+        f"(budget {CHECK_SOFT_BUDGET_SECONDS:.0f}s); AgentD3 feedback "
+        f"{outcome['outcome']}."
+    )
+    with log_path.open("a") as log:
+        log.write(f"\n{message}\n")
+    if outcome["outcome"] == "enqueued":
+        say(message)
+    else:
+        warn(message + " Gate remains green; optimization feedback is best-effort.")
 
 
 def log_tail(log_path: Path, n: int = 50) -> str:
@@ -1537,7 +1667,7 @@ def cmd_submit(args) -> int:
             # check
             lock.set_phase("checking", branch)
             say(f"checking candidate {short(gate, 'HEAD')} ...")
-            rc, timed_out = run_gate_check(repo, gate, log_path)
+            rc, timed_out, check_seconds = run_gate_check(repo, gate, log_path)
             if rc != 0 or timed_out:
                 journal(
                     repo,
@@ -1629,6 +1759,10 @@ def cmd_submit(args) -> int:
                 publish(repo, C)
             set_last_green(repo, C)
             journal(repo, "complete", merged=C, branch=branch)
+            if check_seconds > CHECK_SOFT_BUDGET_SECONDS:
+                lock.enqueue_slow_gate_after_release(
+                    branch, C, check_seconds, log_path
+                )
 
             say("")
             say("GATE PASSED")
@@ -1689,7 +1823,9 @@ def cmd_adopt(args) -> int:
             # check at the main tip in the gate worktree
             lock.set_phase("checking", "adopt")
             say(f"checking main tip {short(repo.canonical, tip)} ...")
-            rc, timed_out = run_gate_check(repo, repo.gate_path, log_path)
+            rc, timed_out, check_seconds = run_gate_check(
+                repo, repo.gate_path, log_path
+            )
             if rc != 0 or timed_out:
                 journal(
                     repo,
@@ -1758,6 +1894,10 @@ def cmd_adopt(args) -> int:
                 publish(repo, tip)
             set_last_green(repo, tip)
             journal(repo, "complete", merged=tip, adopt=True, branch="adopt")
+            if check_seconds > CHECK_SOFT_BUDGET_SECONDS:
+                lock.enqueue_slow_gate_after_release(
+                    "adopt", tip, check_seconds, log_path
+                )
 
             say("")
             say("ADOPTED")

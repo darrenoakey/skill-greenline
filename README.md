@@ -152,7 +152,7 @@ tail -f submit.log
 
 greenline calls two scripts in your repo:
 
-- **`./run check`** — run from the gate worktree. Must build, lint, and run the full test suite against a test datastore. Exit code is the verdict. Must be safe to run concurrently from multiple worktrees.
+- **`./run check`** — run from the gate worktree. Must build, lint, and run the full test suite against a test datastore. Exit code is the verdict. Must be safe to run concurrently from multiple worktrees. Five minutes is a soft budget; successful checks may continue to the 10-minute hard timeout. A 5–10 minute success remains green and, after completion and lock release, creates a best-effort AgentD3 optimization task. Beyond 10 minutes the whole check process group is killed and the gate fails without a task.
 - **`./run deploy`** — run from the canonical checkout. Must rebuild and restart production, health-check, and exit nonzero if unhealthy. Must be idempotent.
 - **`./run health`** *(optional)* — a probe with no side effects. If absent, greenline re-runs `deploy` as the health probe.
 
