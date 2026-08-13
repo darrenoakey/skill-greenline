@@ -92,12 +92,14 @@ the tests themselves are designed **together** to survive this environment:
 **Five minutes is the soft `check` budget; ten minutes is the hard timeout.** A
 successful check at or below five minutes passes normally. A successful check
 after five but within ten minutes also passes; after deploy, publish, and
-`last-green` are complete and the gate lock is released, Greenline invokes
-`agentd3 task enqueue-slow-gate` with the canonical repo, candidate SHA, and
-monotonic duration. That feedback is best-effort: failure is loud and journaled
-but never makes a healthy candidate red. Beyond ten minutes, Greenline kills the
-whole process group and fails the submission without creating a task. Neither
-threshold has a config knob.
+`last-green` are complete and the gate lock is released, Greenline tells the
+agent that ran it, in that submission's own output, that making the check fit
+the budget is its MANDATORY NEXT TASK. Nothing is scheduled, queued, or handed
+to another agent: the agent who paid the slow gate fixes it before doing
+anything else. That report is best-effort — a failure to print or journal it is
+loud but never makes a healthy candidate red. Beyond ten minutes, Greenline
+kills the whole process group and fails the submission. Neither threshold has a
+config knob.
 
 The remedy is never raising the limit. It is making the suite fast:
 

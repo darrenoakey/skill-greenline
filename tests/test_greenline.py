@@ -179,31 +179,21 @@ def journal_events(repo: Path):
     return [json.loads(ln) for ln in j.read_text().splitlines() if ln.strip()]
 
 
-def install_agentd3(tmp_path: Path, record: Path, exit_code: int = 0) -> Path:
-    """Install a recorder CLI that also proves completion and lock release."""
+def install_agentd3_tripwire(tmp_path: Path, record: Path) -> Path:
+    """Install an `agentd3` on PATH that records ANY invocation.
+
+    A slow gate must instruct the agent that ran it, never create work
+    somewhere else. This stub is the tripwire: if greenline ever shells out to
+    agentd3 again (to enqueue a scheduled task, or anything else), the record
+    file appears and the test fails.
+    """
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
     cli = bindir / "agentd3"
     cli.write_text(
         "#!/usr/bin/env python3\n"
-        "import fcntl, json, subprocess, sys\n"
-        "repo = sys.argv[sys.argv.index('--repo') + 1]\n"
-        "common = subprocess.run(['git', '-C', repo, 'rev-parse', "
-        "'--path-format=absolute', '--git-common-dir'], check=True, "
-        "capture_output=True, text=True).stdout.strip()\n"
-        "journal = common + '/greenline/journal.jsonl'\n"
-        "events = [json.loads(line)['event'] for line in open(journal)]\n"
-        "lock = open(common + '/greenline/lock', 'w')\n"
-        "unlocked = True\n"
-        "try:\n"
-        "    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
-        "except OSError:\n"
-        "    unlocked = False\n"
-        "payload = {'argv': sys.argv[1:], "
-        "'complete_before_call': events[-1] == 'complete', "
-        "'lock_released': unlocked}\n"
-        f"open({str(record)!r}, 'w').write(json.dumps(payload))\n"
-        f"raise SystemExit({exit_code})\n"
+        "import json, sys\n"
+        f"open({str(record)!r}, 'w').write(json.dumps(sys.argv[1:]))\n"
     )
     cli.chmod(0o755)
     return bindir
@@ -1180,32 +1170,47 @@ def test_check_timing_defaults_are_five_soft_ten_hard_minutes():
     assert mod.CHECK_HARD_TIMEOUT_SECONDS == 600
 
 
-def test_check_within_soft_budget_creates_no_task(tmp_path, capsys, monkeypatch):
+def test_check_within_soft_budget_says_nothing(tmp_path, capsys, monkeypatch):
     repo = setup_repo(tmp_path, "fastcheck")
     wt = make_worktree(repo, "fast")
     commit_in(wt, "fast.txt", "fast\n", "fast check")
     record = tmp_path / "agentd3.json"
-    bindir = install_agentd3(tmp_path, record)
+    bindir = install_agentd3_tripwire(tmp_path, record)
     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
 
     mod = load_greenline_module()
     mod.CHECK_SOFT_BUDGET_SECONDS = 60
     mod.CHECK_HARD_TIMEOUT_SECONDS = 61
     assert mod.main(["submit", "--repo", str(wt)]) == 0
-    capsys.readouterr()
+    out = capsys.readouterr().out
 
     assert not record.exists()
+    assert "MANDATORY NEXT TASK" not in out
     assert not [e for e in journal_events(repo) if e["event"] == "gate_slow"]
 
 
-def test_slow_submit_notifies_once_after_completion_and_unlock(
+def test_slow_gate_directive_orders_the_agent_to_optimize_now():
+    """An over-budget gate must read as THIS agent's next task. Scheduling it,
+    deferring it, or handing it to someone else is exactly what this replaced."""
+    mod = load_greenline_module()
+    directive = mod.slow_gate_directive(412.0)
+
+    assert directive.startswith("MANDATORY NEXT TASK")
+    assert "412.0s" in directive and "300s" in directive
+    for escape in ("Do NOT schedule", "defer", "another agent"):
+        assert escape in directive
+    for cheat in ("weaken", "skip", "extend deadlines", "change the budget"):
+        assert cheat in directive
+
+
+def test_slow_submit_orders_its_own_agent_after_completion_and_unlock(
     tmp_path, capsys, monkeypatch
 ):
     repo = setup_repo(tmp_path, "slowsuccess")
     wt = make_worktree(repo, "slow")
     commit_in(wt, "slow.txt", "slow\n", "slow successful check")
     record = tmp_path / "agentd3.json"
-    bindir = install_agentd3(tmp_path, record)
+    bindir = install_agentd3_tripwire(tmp_path, record)
     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
 
     mod = load_greenline_module()
@@ -1214,55 +1219,41 @@ def test_slow_submit_notifies_once_after_completion_and_unlock(
     assert mod.main(["submit", "--repo", str(wt)]) == 0
     out = capsys.readouterr().out
 
-    calls = json.loads(record.read_text())
+    assert not record.exists(), "a slow gate must not create work outside this agent"
     slow = [e for e in journal_events(repo) if e["event"] == "gate_slow"]
     assert len(slow) == 1
-    event = slow[0]
-    expected_seconds = format(event["seconds"], ".6f").rstrip("0").rstrip(".")
-    assert calls == {
-        "argv": [
-            "task",
-            "enqueue-slow-gate",
-            "--repo",
-            str(repo.resolve()),
-            "--gate-sha",
-            sha(repo, "main"),
-            "--seconds",
-            expected_seconds,
-        ],
-        "complete_before_call": True,
-        "lock_released": True,
-    }
-    assert event["enqueue_outcome"] == "enqueued"
-    assert "SOFT CHECK BUDGET EXCEEDED" in out
+    assert slow[0]["candidate"] == sha(repo, "main")
+    assert slow[0]["budget_seconds"] == 0 and slow[0]["seconds"] > 0
+    assert "SOFT CHECK BUDGET EXCEEDED" in out and "MANDATORY NEXT TASK" in out
+    # green first, told second: the gate completed before the agent is directed
     assert journal_events(repo)[-2]["event"] == "complete"
     status = gl(repo, "status", expect=0)
     assert "gate_slow" in status.stdout
     latest_log = sorted((common_dir(repo) / "greenline" / "logs").glob("*.log"))[-1]
-    assert "SOFT CHECK BUDGET EXCEEDED" in latest_log.read_text()
+    logged = latest_log.read_text()
+    assert "SOFT CHECK BUDGET EXCEEDED" in logged and "MANDATORY NEXT TASK" in logged
 
 
-def test_slow_notification_failure_keeps_submit_green(
-    tmp_path, capsys, monkeypatch
-):
+def test_slow_report_failure_keeps_submit_green(tmp_path, capsys, monkeypatch):
+    """Optimization feedback is best-effort: the gate has already passed and
+    published, so a broken report must never turn it red."""
     repo = setup_repo(tmp_path, "notifyfail")
     wt = make_worktree(repo, "slow")
     commit_in(wt, "slow.txt", "slow\n", "slow successful check")
-    record = tmp_path / "agentd3.json"
-    bindir = install_agentd3(tmp_path, record, exit_code=7)
-    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
 
     mod = load_greenline_module()
     mod.CHECK_SOFT_BUDGET_SECONDS = 0
     mod.CHECK_HARD_TIMEOUT_SECONDS = 10
+
+    def explode(*_args, **_kwargs):
+        raise RuntimeError("journal is unwritable")
+
+    monkeypatch.setattr(mod, "report_slow_gate", explode)
     assert mod.main(["submit", "--repo", str(wt)]) == 0
     captured = capsys.readouterr()
 
     assert sha(repo, "main") == sha(repo, "refs/greenline/last-green")
-    slow = [e for e in journal_events(repo) if e["event"] == "gate_slow"]
-    assert len(slow) == 1 and slow[0]["enqueue_outcome"] == "failed"
-    assert slow[0]["rc"] == 7
-    assert "Gate remains green" in captured.err
+    assert "slow-gate feedback reporting failed" in captured.err
 
 
 def test_check_timeout_fails_the_gate_and_reaps_children(
@@ -1276,7 +1267,7 @@ def test_check_timeout_fails_the_gate_and_reaps_children(
     run_git(wt, "add", "-A")
     run_git(wt, "commit", "-q", "-m", "slow check")
     notification = tmp_path / "agentd3.json"
-    bindir = install_agentd3(tmp_path, notification)
+    bindir = install_agentd3_tripwire(tmp_path, notification)
     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
 
     mod = load_greenline_module()
@@ -1332,7 +1323,7 @@ def test_adopt_check_timeout_is_a_failure_too(tmp_path, capsys):
     assert last["reason"] == mod.CHECK_TIMEOUT_REASON
 
 
-def test_slow_adopt_notifies_after_success(tmp_path, capsys, monkeypatch):
+def test_slow_adopt_orders_the_adopting_agent(tmp_path, capsys, monkeypatch):
     repo = setup_repo(tmp_path, "slowadoptsuccess")
     with with_main_unlocked(repo):
         (repo / "adopt.txt").write_text("adopt\n")
@@ -1340,27 +1331,20 @@ def test_slow_adopt_notifies_after_success(tmp_path, capsys, monkeypatch):
         run_git(repo, "commit", "-q", "-m", "out of gate change")
     tip = sha(repo, "main")
     record = tmp_path / "agentd3.json"
-    bindir = install_agentd3(tmp_path, record)
+    bindir = install_agentd3_tripwire(tmp_path, record)
     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
 
     mod = load_greenline_module()
     mod.CHECK_SOFT_BUDGET_SECONDS = 0
     mod.CHECK_HARD_TIMEOUT_SECONDS = 10
     assert mod.main(["adopt", "--repo", str(repo)]) == 0
-    capsys.readouterr()
+    out = capsys.readouterr().out
 
-    call = json.loads(record.read_text())
-    assert call["argv"][:6] == [
-        "task",
-        "enqueue-slow-gate",
-        "--repo",
-        str(repo.resolve()),
-        "--gate-sha",
-        tip,
-    ]
-    assert call["complete_before_call"] and call["lock_released"]
+    assert not record.exists()
+    assert "MANDATORY NEXT TASK" in out
     slow = [e for e in journal_events(repo) if e["event"] == "gate_slow"]
     assert len(slow) == 1 and slow[0]["branch"] == "adopt"
+    assert slow[0]["candidate"] == tip
 
 
 # --------------------------------------------------------------------------

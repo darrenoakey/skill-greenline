@@ -41,9 +41,10 @@ Under an exclusive lock (other submits queue behind it):
 2. **Squash-merge** your branch in the gate worktree. Conflict or empty diff → fail fast.
 3. **Check** — run `{check}` with cwd = the gate worktree. **5 minutes is a soft
    budget; 10 minutes is the hard timeout.** A successful 5–10 minute check stays
-   green and creates a best-effort AgentD3 optimization task after the completed
-   gate releases its lock. Beyond 10 minutes the whole process group is killed,
-   main remains untouched, and no task is created. See docs/DOCTRINE.md,
+   green, and once the completed gate releases its lock greenline tells the
+   submitting agent that making the check fit the budget is its mandatory next
+   task — never scheduled, deferred, or delegated. Beyond 10 minutes the whole
+   process group is killed and main remains untouched. See docs/DOCTRINE.md,
    "The check time budget".
 4. **Advance** — fast-forward the canonical `{main_branch}` to the candidate.
 5. **Deploy** — run `{deploy}` with cwd = the canonical checkout. Nonzero → **automatic rollback**: main resets to the previous commit and `{deploy}` re-runs to restore prod.
@@ -54,8 +55,8 @@ Under an exclusive lock (other submits queue behind it):
 - **`{check}`** — cwd = the worktree being gated. Build + lint + FULL tests against a
   **test** datastore. Exit code is the verdict. Must run concurrently from multiple
   worktrees. Five minutes is the soft budget and 10 minutes is the hard timeout
-  (no override); successful soft-budget breaches stay green and feed an AgentD3
-  optimization task after gate completion.
+  (no override); a successful soft-budget breach stays green and directs the
+  submitting agent to optimize the check as its next task.
 - **`{deploy}`** — cwd = the canonical checkout. Rebuild/restart prod (e.g.
   `auto -q restart {service}`), **health-check**, exit nonzero on unhealthy, and be
   **idempotent** (rollback re-runs it).

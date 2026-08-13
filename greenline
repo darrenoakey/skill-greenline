@@ -39,8 +39,6 @@ LAST_GREEN_REF = "refs/greenline/last-green"
 CHECK_SOFT_BUDGET_SECONDS = 300
 CHECK_HARD_TIMEOUT_SECONDS = 600
 CHECK_TIMEOUT_REASON = "check exceeded the 10-minute hard timeout"
-SLOW_GATE_ENQUEUE_TIMEOUT_SECONDS = 15
-SLOW_GATE_OUTPUT_LIMIT_BYTES = 4096
 
 SKILL_DIR = Path(__file__).resolve().parent
 TEMPLATE_DIR = SKILL_DIR / "templates"
@@ -456,10 +454,10 @@ class GateLock:
         with contextlib.suppress(FileNotFoundError):
             self.repo.status_path.unlink()
 
-    def enqueue_slow_gate_after_release(
+    def require_optimization_after_release(
         self, branch: str, candidate: str, seconds: float, log_path: Path
     ) -> None:
-        """Remember a successful slow gate for best-effort post-lock feedback."""
+        """Remember a slow-but-green gate so its agent is told after unlock."""
         self.slow_gate = {
             "branch": branch,
             "candidate": candidate,
@@ -716,107 +714,50 @@ def check_timeout_banner(log_path: Path) -> None:
     say(f"log: {log_path}")
 
 
-def _bounded_pipe_reader(pipe, limit: int, chunks: list[bytes]) -> None:
-    """Drain a child pipe while retaining only a bounded diagnostic prefix."""
-    while True:
-        data = pipe.read(1024)
-        if not data:
-            return
-        remaining = limit - sum(len(chunk) for chunk in chunks)
-        if remaining > 0:
-            chunks.append(data[:remaining])
-
-
-def safe_agent_environment() -> dict[str, str]:
-    """Pass only standard OS process context, never secret/config variables."""
-    allowed = ("HOME", "PATH", "USER", "LANG", "LC_ALL", "TMPDIR")
-    return {name: os.environ[name] for name in allowed if name in os.environ}
-
-
-def enqueue_slow_gate(repo: Repo, candidate: str, seconds: float) -> dict:
-    """Best-effort AgentD3 feedback call with bounded time and captured output."""
-    argv = [
-        "agentd3",
-        "task",
-        "enqueue-slow-gate",
-        "--repo",
-        str(repo.canonical),
-        "--gate-sha",
-        candidate,
-        "--seconds",
-        format(seconds, ".6f").rstrip("0").rstrip("."),
-    ]
-    try:
-        proc = subprocess.Popen(
-            argv,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-            env=safe_agent_environment(),
-        )
-    except OSError as exc:
-        return {"outcome": "unavailable", "error": type(exc).__name__}
-    stdout: list[bytes] = []
-    stderr: list[bytes] = []
-    readers = [
-        threading.Thread(
-            target=_bounded_pipe_reader,
-            args=(proc.stdout, SLOW_GATE_OUTPUT_LIMIT_BYTES, stdout),
-            daemon=True,
-        ),
-        threading.Thread(
-            target=_bounded_pipe_reader,
-            args=(proc.stderr, SLOW_GATE_OUTPUT_LIMIT_BYTES, stderr),
-            daemon=True,
-        ),
-    ]
-    for reader in readers:
-        reader.start()
-    try:
-        proc.wait(timeout=SLOW_GATE_ENQUEUE_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired:
-        _kill_process_group(proc)
-        outcome = {"outcome": "timeout"}
-    else:
-        outcome = (
-            {"outcome": "enqueued"}
-            if proc.returncode == 0
-            else {"outcome": "failed", "rc": proc.returncode}
-        )
-    for reader in readers:
-        reader.join(timeout=1)
-    # Output is deliberately captured and discarded: it may contain secrets.
-    outcome["captured_bytes"] = len(b"".join(stdout)) + len(b"".join(stderr))
-    return outcome
+def slow_gate_directive(seconds: float) -> str:
+    """The mandatory next-task instruction an over-budget gate hands its agent."""
+    budget = f"{CHECK_SOFT_BUDGET_SECONDS:.0f}"
+    return (
+        f"MANDATORY NEXT TASK: this gate was green, but ./run check took "
+        f"{seconds:.1f}s against a {budget}s budget. Before you start anything "
+        f"else, make ./run check finish under {budget}s: measure the slowest "
+        "packages, fix the real production cause, and re-verify. Do NOT weaken, "
+        "skip or shorten tests, extend deadlines, or change the budget. Do NOT "
+        "schedule it, defer it, or hand it to another agent - it is your next "
+        "task."
+    )
 
 
 def report_slow_gate(
     repo: Repo, branch: str, candidate: str, seconds: float, log_path: Path
 ) -> None:
-    """Journal and display a successful soft-budget breach after lock release."""
-    try:
-        outcome = enqueue_slow_gate(repo, candidate, seconds)
-    except Exception as exc:  # noqa: BLE001 - feedback must never redden a gate
-        outcome = {"outcome": "error", "error": type(exc).__name__}
-    fields = {
-        "branch": branch,
-        "candidate": candidate,
-        "seconds": round(seconds, 6),
-        "enqueue_outcome": outcome["outcome"],
-        **{key: value for key, value in outcome.items() if key != "outcome"},
-    }
-    journal(repo, "gate_slow", **fields)
-    message = (
-        f"SOFT CHECK BUDGET EXCEEDED: {seconds:.3f}s "
-        f"(budget {CHECK_SOFT_BUDGET_SECONDS:.0f}s); AgentD3 feedback "
-        f"{outcome['outcome']}."
+    """Tell the submitting agent to optimize, after the lock is released.
+
+    The gate already succeeded, so this must never redden it and must never
+    push the work somewhere else. The agent that ran the slow gate is told in
+    its own output that optimizing the check is its next task; nothing is
+    enqueued, scheduled, or delegated to another process.
+    """
+    journal(
+        repo,
+        "gate_slow",
+        branch=branch,
+        candidate=candidate,
+        seconds=round(seconds, 6),
+        budget_seconds=CHECK_SOFT_BUDGET_SECONDS,
     )
+    header = (
+        f"SOFT CHECK BUDGET EXCEEDED: {seconds:.3f}s "
+        f"(budget {CHECK_SOFT_BUDGET_SECONDS:.0f}s)."
+    )
+    directive = slow_gate_directive(seconds)
     with log_path.open("a") as log:
-        log.write(f"\n{message}\n")
-    if outcome["outcome"] == "enqueued":
-        say(message)
-    else:
-        warn(message + " Gate remains green; optimization feedback is best-effort.")
+        log.write(f"\n{header}\n{directive}\n")
+    say("")
+    say("=" * 60)
+    say(header)
+    say(directive)
+    say("=" * 60)
 
 
 def log_tail(log_path: Path, n: int = 50) -> str:
@@ -1760,7 +1701,7 @@ def cmd_submit(args) -> int:
             set_last_green(repo, C)
             journal(repo, "complete", merged=C, branch=branch)
             if check_seconds > CHECK_SOFT_BUDGET_SECONDS:
-                lock.enqueue_slow_gate_after_release(
+                lock.require_optimization_after_release(
                     branch, C, check_seconds, log_path
                 )
 
@@ -1895,7 +1836,7 @@ def cmd_adopt(args) -> int:
             set_last_green(repo, tip)
             journal(repo, "complete", merged=tip, adopt=True, branch="adopt")
             if check_seconds > CHECK_SOFT_BUDGET_SECONDS:
-                lock.enqueue_slow_gate_after_release(
+                lock.require_optimization_after_release(
                     "adopt", tip, check_seconds, log_path
                 )
 
