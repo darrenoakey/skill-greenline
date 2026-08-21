@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+"""greenline-speedup — launch the agentic-high task that fixes a slow gate.
+
+Invoked by greenline itself (see trigger_speedup_task in the `greenline`
+script) immediately after a gate PASSES with `./run check` over its soft
+time budget — never on a failed or timed-out check. It never runs the fix
+itself: it puts a fresh greenline worktree in place and hands the real work
+to a dedicated agentd3 conversation (model "agentic-high", source
+"greenline-speedup"), then gets out of the way. Safe to run by hand for the
+same purpose: `greenline-speedup --repo <canonical> --seconds <n> --budget
+<n> --hard-timeout <n>` (branch/candidate/log are optional context).
+
+Stdlib only, like greenline itself. Talks to the local agentd3 daemon over
+plain HTTP (default http://127.0.0.1:8620, override with AGENTD3_API) using
+urllib — no third-party client, no `curl` subprocess.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+SOURCE = "greenline-speedup"
+MODEL = "agentic-high"
+API_BASE_DEFAULT = "http://127.0.0.1:8620"
+
+
+def marker_path(repo: Path, date: str) -> Path:
+    """Locate today's trigger marker inside the repo's greenline state dir.
+
+    Deliberately NOT inside the speed-up worktree: an untracked file at a
+    worktree's root makes that worktree permanently dirty, and `greenline
+    submit` refuses a dirty worktree — so the speed-up task could never land
+    its own fix without first moving the marker out of its way. The state dir
+    is shared by every worktree of the repo (it lives in the common git dir),
+    which is exactly the scope this per-repo-per-day dedupe needs.
+    """
+    common = subprocess.run(
+        ["git", "rev-parse", "--git-common-dir"],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    state = (repo / common).resolve() / "greenline"
+    state.mkdir(parents=True, exist_ok=True)
+    return state / f"speedup-{date}.json"
+
+
+def utcdate() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%d")
+
+
+def api_base() -> str:
+    return os.environ.get("AGENTD3_API", API_BASE_DEFAULT).rstrip("/")
+
+
+def api_post(path: str, body: dict) -> dict:
+    url = f"{api_base()}{path}"
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, method="POST", headers={"Content-Type": "application/json"}
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+ALREADY_EXISTS_RE = re.compile(r"worktree path already exists: (.+)$", re.MULTILINE)
+
+
+def ensure_worktree(repo: Path, name: str) -> Path:
+    """Create (or reuse) the dedicated worktree for today's speed-up task.
+
+    Delegates to `greenline worktree` — the same safe, isolated-from-main
+    path any agent uses — rather than touching git directly, and specifically
+    NEVER re-derives worktree_base itself: a machine-local
+    ~/.config/greenline/config.toml entry can (and for several real repos,
+    including the one that motivated this feature, does) override the
+    committed greenline.toml, so this must resume into the exact path
+    `greenline` itself already resolved and printed, not a guess.
+
+    If a worktree of this name already exists, a speed-up task for this repo
+    today has already gotten this far; the caller decides from the marker
+    file whether that means "done" or "resume".
+    """
+    greenline = str(Path(__file__).resolve().parent / "greenline")
+    proc = subprocess.run(
+        [sys.executable, greenline, "worktree", name, "--repo", str(repo)],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode == 0:
+        lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
+        if not lines:
+            raise RuntimeError(f"greenline worktree produced no path:\n{proc.stdout}")
+        return Path(lines[-1])
+    match = ALREADY_EXISTS_RE.search(proc.stderr) or ALREADY_EXISTS_RE.search(
+        proc.stdout
+    )
+    if match:
+        existing = Path(match.group(1).strip())
+        if existing.exists():
+            return existing
+    raise RuntimeError(
+        f"greenline worktree {name} --repo {repo} failed "
+        f"(rc={proc.returncode}):\n{proc.stdout}\n{proc.stderr}"
+    )
+
+
+def build_prompt(
+    repo_name: str,
+    branch: str,
+    candidate: str,
+    seconds: float,
+    budget: float,
+    hard_timeout: float,
+    log_path: str,
+) -> str:
+    candidate_short = candidate[:12] if candidate else "unknown"
+    log_line = (
+        f"Slow run's full log: {log_path}\n"
+        if log_path
+        else "No log path was recorded for the slow run.\n"
+    )
+    return f"""You are responding to an automated greenline gate signal, not a live \
+user request.
+
+Repo: {repo_name}
+Trigger: candidate {branch} ({candidate_short}) passed the greenline gate, but \
+`./run check` took {seconds:.1f}s — over one third of the gate's absolute \
+failure timeout (soft budget {budget:.0f}s, hard timeout {hard_timeout:.0f}s). \
+The gate is GREEN and the change already landed on main; nothing is broken \
+and nothing needs reverting. Your job is speed, not correctness.
+
+You are already inside a fresh greenline worktree for this repo — this \
+directory is it. Read this repo's docs/DOCTRINE.md, section "The check time \
+budget", for the house rules before you start.
+
+{log_line}
+Do:
+1. Read the log above and find out where the time actually went (build? \
+lint? a specific slow package or suite? cold caches? something serialized \
+that should be parallel?).
+2. Fix the real cause in this worktree: parallelize, warm/reuse caches, seed \
+fixtures instead of rebuilding the world, split monolithic integration \
+tests, record/replay external calls — whatever actually applies. Do NOT \
+weaken, skip, or shorten tests, extend deadlines, or ask for the budget to \
+be raised — those are explicitly forbidden, for you the same as for anyone \
+else.
+3. Run ./run check locally and confirm it finishes comfortably under \
+{budget:.0f}s.
+4. `greenline submit` this branch through the normal gate — it serializes, \
+so wait if it's busy.
+5. `greenline done` once it lands.
+
+If you cannot get it under budget in one pass, land whatever real \
+improvement you found anyway (submit it — a partial win still helps) and \
+leave a clear note in the commit message about what is left.
+"""
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(
+        prog="greenline-speedup",
+        description="Launch the agentic-high task that speeds up a slow-but-green gate.",
+    )
+    p.add_argument("--repo", required=True, help="canonical checkout path")
+    p.add_argument("--branch", default="(unknown)")
+    p.add_argument("--candidate", default="")
+    p.add_argument("--seconds", type=float, required=True)
+    p.add_argument("--budget", type=float, required=True)
+    p.add_argument("--hard-timeout", type=float, required=True)
+    p.add_argument("--log", default="")
+    args = p.parse_args(argv)
+
+    repo = Path(args.repo).resolve()
+    repo_name = repo.name
+    date = utcdate()
+    worktree_name = f"speedup-{date}"
+    idempotency_key = f"{SOURCE}:{repo_name}:{date}"
+
+    # Before `greenline worktree`, which blocks on the gate lock for as long as
+    # any submission's check+deploy takes: a repeat trigger must cost nothing.
+    marker = marker_path(repo, date)
+    if marker.exists():
+        info = json.loads(marker.read_text())
+        print(
+            f"already triggered today for {repo_name}: "
+            f"conversation {info.get('conversation_id')} ({marker})"
+        )
+        return 0
+
+    wt = ensure_worktree(repo, worktree_name)
+
+    prompt = build_prompt(
+        repo_name,
+        args.branch,
+        args.candidate,
+        args.seconds,
+        args.budget,
+        args.hard_timeout,
+        args.log,
+    )
+    origin_ref = (
+        f"{args.branch}@{args.candidate[:12]}" if args.candidate else args.branch
+    )
+    create_body = {
+        "model": MODEL,
+        "cwd": str(wt),
+        "policy": "yolo",
+        "title": (
+            f"greenline speedup: {repo_name} check ran {args.seconds:.0f}s "
+            f"(budget {args.budget:.0f}s)"
+        ),
+        "source": SOURCE,
+        "idempotency_key": idempotency_key,
+        "origin": {
+            "kind": "service",
+            "actor": "greenline",
+            "ref": origin_ref,
+            "detail": (
+                f"check took {args.seconds:.1f}s vs {args.budget:.0f}s soft budget "
+                f"(hard timeout {args.hard_timeout:.0f}s)"
+            ),
+        },
+    }
+
+    try:
+        created = api_post("/v1/conversations", create_body)
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        print(f"error: could not reach agentd3 at {api_base()}: {exc}", file=sys.stderr)
+        return 1
+
+    conv_id = created.get("conversation_id")
+    if not conv_id:
+        print(
+            f"error: agentd3 create response had no conversation_id: {created}",
+            file=sys.stderr,
+        )
+        return 1
+
+    if not created.get("replayed"):
+        try:
+            api_post(f"/v1/conversations/{conv_id}/messages", {"text": prompt})
+        except (urllib.error.URLError, OSError, TimeoutError) as exc:
+            print(
+                f"error: created {conv_id} but could not post the prompt: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"launched speed-up task: conversation {conv_id} (cwd {wt})")
+    else:
+        print(
+            f"reused already-running speed-up task: conversation {conv_id} (cwd {wt})"
+        )
+
+    marker.write_text(
+        json.dumps(
+            {
+                "conversation_id": conv_id,
+                "idempotency_key": idempotency_key,
+                "created_utc": datetime.now(timezone.utc).isoformat(),
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
