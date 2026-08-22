@@ -1401,3 +1401,37 @@ def test_machine_config_worktree_base_outranks_the_committed_one(tmp_path, monke
     # a repo the override does not name keeps its committed base
     (cfg_dir / "config.toml").write_text('[worktree_base]\nother = "/tmp/other"\n')
     assert mod.load_repo(repo).worktree_base == committed
+
+
+def test_worktree_base_under_volumes_is_prefix_only():
+    """The /Volumes trap is a path-prefix question. Never require the
+    volume to be mounted — resolving it is how a wedged disk hangs the gate."""
+    mod = load_greenline_module()
+    assert mod.worktree_base_under_volumes("/Volumes/Gumby/x")
+    assert mod.worktree_base_under_volumes("/Volumes")
+    assert not mod.worktree_base_under_volumes("~/nope")
+    assert not mod.worktree_base_under_volumes("/Users/x/.greenline-worktrees/r")
+    assert not mod.worktree_base_under_volumes("/tmp/Volumes/nope")
+    assert not mod.worktree_base_under_volumes("/VolumesNotAVolume/x")
+
+
+def test_doctor_fails_when_worktree_base_is_under_volumes(tmp_path):
+    """A deliberately-broken fixture whose resolved base is /Volumes/Gumby/x
+    must redden doctor. The same repo on an internal base must stay green
+    for this check."""
+    repo = setup_repo(tmp_path, "voltrap")
+    pd_ok = gl(repo, "doctor", expect=0)
+    assert "[ok ] worktree_base on internal disk" in pd_ok.stdout
+    assert "FAIL" not in pd_ok.stdout
+
+    text = (repo / "greenline.toml").read_text()
+    old = f'worktree_base = "{tmp_path / "wt" / "voltrap"}"'
+    assert old in text
+    (repo / "greenline.toml").write_text(
+        text.replace(old, 'worktree_base = "/Volumes/Gumby/x"')
+    )
+    pd = gl(repo, "doctor")
+    assert pd.returncode == 2, pd.stdout + pd.stderr
+    assert "[FAIL] worktree_base on internal disk" in pd.stdout
+    assert "/Volumes/Gumby/x" in pd.stdout
+

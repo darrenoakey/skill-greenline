@@ -29,6 +29,7 @@ from `greenline.toml` (committed at the repo root) and CLI args.
 | `greenline deploy-pending [--repo PATH]` | Deploy a gated `main` whose deploy was coalesced away and never picked up (only reachable with `coalesce_deploys = true`, and only if the process that should have deployed died). No-op when nothing is pending. | 0 / 1 |
 | `greenline status [--repo PATH]` | No lock. Show lock holder (+ PID liveness), SHA drift (main / origin / last-green / deployed) with an OK/DRIFT verdict, last 3 journal entries, gate worktree cleanliness, latest log. | 0 |
 | `greenline doctor [--fix] [--repo PATH]` | Check all invariants and report. `--fix` acquires the lock and runs the preflight reconcile (crash recovery + drift reconciliation). | 0 ok / 2 problems |
+| `greenline bases` | Print every gated repo under `~/src` and its resolved `worktree_base` (machine config > committed toml > default). Exit 2 if any path is under `/Volumes`. | 0 / 2 |
 
 Add `-v`/`--verbose` for git + command output (default is terse — house convention).
 

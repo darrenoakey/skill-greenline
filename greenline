@@ -344,6 +344,55 @@ def default_worktree_base(reponame: str) -> str:
     return str(Path.home() / "greenline-worktrees" / reponame)
 
 
+def worktree_base_under_volumes(base: Path | str) -> bool:
+    """True when the configured worktree base lives under /Volumes.
+
+    Prefix match only — never stat or resolve. A wedged removable volume
+    hangs mkdir/stat, which is the failure this check exists to prevent.
+    """
+    text = os.path.expanduser(str(base)).replace("\\", "/")
+    return text == "/Volumes" or text.startswith("/Volumes/")
+
+
+_GATED_SKIP_DIRS = {
+    "_archive",
+    ".greenline-worktrees",
+    ".agentd3-worktrees",
+    "node_modules",
+    ".git",
+    "venv",
+    ".venv",
+}
+
+
+def discover_gated_repos() -> list[Path]:
+    """Canonical checkouts under ~/src that carry a greenline.toml.
+
+    Linked worktrees share a canonical checkout; listing them as their
+    own repos would reprint the same resolved base under a directory name.
+    """
+    src = Path.home() / "src"
+    found: dict[Path, Path] = {}
+    if not src.is_dir():
+        return []
+    for pat in ("*/greenline.toml", "*/*/greenline.toml"):
+        for toml in src.glob(pat):
+            if any(part in _GATED_SKIP_DIRS for part in toml.parts):
+                continue
+            parent = toml.parent
+            git = parent / ".git"
+            if not (git.exists() or git.is_file()):
+                continue
+            try:
+                canon = canonical_path(parent)
+            except GitError:
+                continue
+            if canon != parent.resolve():
+                continue
+            found[canon] = parent
+    return [found[key] for key in sorted(found)]
+
+
 def load_repo(start: str | Path | None) -> Repo:
     start = Path(start).resolve() if start else Path.cwd()
     if not is_git_repo(start):
@@ -2014,6 +2063,16 @@ def _doctor_report(repo: Repo) -> bool:
     check("greenline.toml present", (canon / "greenline.toml").exists())
     cv = repo.config.get("contract_version")
     check("contract_version == 1", cv == CONTRACT_VERSION, f"got {cv}")
+    under = worktree_base_under_volumes(repo.worktree_base)
+    check(
+        "worktree_base on internal disk",
+        not under,
+        (
+            f"{repo.worktree_base} is under /Volumes (TCC removable-volume trap)"
+            if under
+            else str(repo.worktree_base)
+        ),
+    )
     check("canonical clean", not worktree_is_dirty(canon))
     on_main = current_branch(canon) == main
     check(f"canonical on {main}", on_main)
@@ -2073,6 +2132,25 @@ def cmd_doctor(args) -> int:
     return 0 if ok else 2
 
 
+def cmd_bases(args) -> int:
+    """Print every gated repo's resolved worktree_base. Exit 2 if any /Volumes."""
+    say("repo\tstatus\tworktree_base")
+    bad = 0
+    for path in discover_gated_repos():
+        repo = load_repo(path)
+        base = repo.worktree_base
+        under = worktree_base_under_volumes(base)
+        if under:
+            bad += 1
+        mark = "VOLUME" if under else "ok"
+        say(f"{path.resolve().name}\t{mark}\t{base}")
+    if bad:
+        say(f"{bad} worktree_base path(s) under /Volumes")
+        return 2
+    return 0
+
+
+
 # --------------------------------------------------------------------------
 # cli
 # --------------------------------------------------------------------------
@@ -2130,6 +2208,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--fix", action="store_true")
     add_repo(sp)
     sp.set_defaults(func=cmd_doctor)
+    sp = sub.add_parser(
+        "bases",
+        help="print resolved worktree_base for every gated repo under ~/src",
+    )
+    sp.set_defaults(func=cmd_bases)
     return p
 
 
