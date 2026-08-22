@@ -1,0 +1,25 @@
+# greenline gate configuration — committed to the repo.
+# See docs/greenline.md and DOCTRINE.md for the workflow and invariants.
+contract_version = 1
+main_branch = "main"
+
+# Verdict command. cwd = the worktree being gated. Must build + lint + run the
+# FULL test suite against a TEST datastore, and exit nonzero on any failure.
+# Must be safe to run concurrently from multiple worktrees.
+check = "./run check"
+
+# Deploy command. cwd = the canonical checkout. Must rebuild/restart prod,
+# health-check, exit nonzero on unhealthy, and be idempotent (safe to re-run).
+# This repo is the greenline CLI itself: deploy is an explicit no-op + health.
+deploy = "./run deploy"
+
+# Health-only probe. Syntax-check both CLIs and confirm they answer --help.
+health = "./run health"
+
+# Informational: no auto service; this is a CLI skill.
+service = "greenline"
+
+# Persistent worktree base for this repo (gate lives at <base>/gate).
+# Internal disk — never /Volumes. Machine ~/.config/greenline/config.toml
+# may outrank this; the committed value must still be on internal disk.
+worktree_base = "~/.greenline-worktrees/greenline"

@@ -1,0 +1,60 @@
+#!/bin/bash
+# greenline ./run — house dispatch facade. Gate contract is check/deploy/health.
+# lint and test are the local pieces check composes. Deploy does not restart
+# any gate or daemon: this repo is a CLI skill, not a supervised service.
+# ./run check is a 10+ min real-git pytest suite. Launch it in its own
+# process group (hub detached / setsid) and sleep; never wait on it in-turn.
+# Stopping agentd3 for the T1.0 proof must not share this session's pgid.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+cd "$ROOT"
+
+PY=(python3)
+
+lint() {
+    echo "==> lint"
+    "${PY[@]}" -m py_compile greenline greenline-speedup
+    ruff check --line-length 120 tests greenline greenline-speedup
+    echo "==> lint passed"
+}
+
+test_all() {
+    echo "==> test"
+    "${PY[@]}" -m pytest tests/ -x -q "$@"
+    echo "==> test passed"
+}
+
+check() {
+    echo "==> check"
+    lint
+    test_all
+    echo "==> check passed"
+}
+
+health() {
+    echo "==> health"
+    test -x "$ROOT/greenline"
+    test -x "$ROOT/greenline-speedup"
+    "${PY[@]}" -m py_compile "$ROOT/greenline" "$ROOT/greenline-speedup"
+    "$ROOT/greenline" -h >/dev/null
+    "$ROOT/greenline-speedup" -h >/dev/null
+    echo "==> health passed"
+}
+
+deploy() {
+    echo "==> deploy: CLI skill has no runtime; idempotent no-op"
+    health
+}
+
+case "${1:-}" in
+    lint) shift; lint "$@" ;;
+    test) shift; test_all "$@" ;;
+    check) shift; check "$@" ;;
+    health) shift; health "$@" ;;
+    deploy) shift; deploy "$@" ;;
+    *)
+        echo "usage: ./run {check|lint|test|health|deploy}" >&2
+        exit 2
+        ;;
+esac
