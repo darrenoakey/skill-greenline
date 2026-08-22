@@ -28,7 +28,7 @@ from `greenline.toml` (committed at the repo root) and CLI args.
 | `greenline done [--force] [--repo PATH]` | From a merged worktree: verify it merged into `last-green`, then remove the worktree + delete the branch. `--force` to skip verification / dirty check. | 0 / 1 |
 | `greenline deploy-pending [--repo PATH]` | Deploy a gated `main` whose deploy was coalesced away and never picked up (only reachable with `coalesce_deploys = true`, and only if the process that should have deployed died). No-op when nothing is pending. | 0 / 1 |
 | `greenline status [--repo PATH]` | No lock. Show lock holder (+ PID liveness), SHA drift (main / origin / last-green / deployed) with an OK/DRIFT verdict, last 3 journal entries, gate worktree cleanliness, latest log. | 0 |
-| `greenline doctor [--fix] [--repo PATH]` | Check all invariants and report. `--fix` acquires the lock and runs the preflight reconcile (crash recovery + drift reconciliation). | 0 ok / 2 problems |
+| `greenline doctor [--fix] [--repo PATH]` | Check all invariants and report. `--fix` acquires the lock and runs the preflight reconcile (crash recovery + drift reconciliation). Fails if the resolved `worktree_base` is under `/Volumes`. | 0 ok / 2 problems |
 | `greenline bases` | Print every gated repo under `~/src` and its resolved `worktree_base` (machine config > committed toml > default). Exit 2 if any path is under `/Volumes`. | 0 / 2 |
 
 Add `-v`/`--verbose` for git + command output (default is terse — house convention).
@@ -95,6 +95,11 @@ that gate:
 [worktree_base]
 agentd3 = "~/.greenline-worktrees/agentd3"
 ```
+
+`greenline doctor` fails closed when the resolved base is under `/Volumes`.
+macOS TCC removable-volume consent is per-binary, unanswerable headless, and
+one refusal wedges the volume for every gate. Never stat or resolve the path
+to decide this — prefix match only.
 
 **Main is hard-locked.** Three hooks installed by `greenline setup`:
 - `reference-transaction` — refuses ANY local update of `refs/heads/main` unless
