@@ -73,7 +73,14 @@ five-minute soft budget and safe to run concurrently from multiple worktrees.
   before slow suites). Playbook: DOCTRINE.md 'The check time budget'.
 - `./run deploy` — cwd = the canonical checkout. Rebuild/restart prod (e.g.
   `auto -q restart <svc>`); MUST health-check, exit nonzero on unhealthy, and be idempotent.
+  **180-second hard timeout** (no override); a deploy killed at the cap is a failed
+  deploy and rolls back exactly like a nonzero exit.
 - `./run health` *(optional)* — probe only; if absent, greenline re-runs `deploy` as the probe.
+  **5-second hard timeout** (no override); a probe that does not answer in time is
+  unhealthy. If your health check cannot fit, it is rebuilding rather than probing.
+
+All three caps are hard, non-configurable, and kill the whole process group on
+expiry: `check` 600s, `deploy` 180s, `health` 5s.
 
 ## State
 

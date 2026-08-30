@@ -40,6 +40,15 @@ CHECK_SOFT_BUDGET_SECONDS = 300
 CHECK_HARD_TIMEOUT_SECONDS = 600
 CHECK_TIMEOUT_REASON = "check exceeded the 10-minute hard timeout"
 
+# Deploy and health get hard deadlines for the same reason: there is exactly one
+# serialized gate, so a command that never returns blocks every agent on the
+# machine forever. Also deliberately not user-configurable; tests patch these
+# module values to exercise the boundaries without waiting for real minutes.
+DEPLOY_HARD_TIMEOUT_SECONDS = 180
+DEPLOY_TIMEOUT_REASON = "deploy exceeded the 3-minute hard timeout"
+HEALTH_HARD_TIMEOUT_SECONDS = 5
+HEALTH_TIMEOUT_REASON = "health probe exceeded the 5-second hard timeout"
+
 SKILL_DIR = Path(__file__).resolve().parent
 TEMPLATE_DIR = SKILL_DIR / "templates"
 DOCTRINE_SRC = SKILL_DIR / "DOCTRINE.md"
@@ -678,9 +687,16 @@ def run_shell_timed(
     return proc.returncode, timed_out
 
 
-def run_shell(cmd: str, cwd: Path, log_path: Path, timeout: float | None = None) -> int:
-    rc, _ = run_shell_timed(cmd, cwd, log_path, timeout)
-    return rc
+def run_gate_deploy(repo: Repo, log_path: Path) -> tuple[int, bool]:
+    """Run the repo's deploy at the canonical checkout under its hard timeout.
+
+    Returns (exit code, timed_out). Every deploy invocation goes through here —
+    a hung deploy is a failed deploy, and takes whatever rollback path its call
+    site already has for a nonzero exit.
+    """
+    return run_shell_timed(
+        repo.deploy_cmd, repo.canonical, log_path, DEPLOY_HARD_TIMEOUT_SECONDS
+    )
 
 
 def run_gate_check(repo: Repo, cwd: Path, log_path: Path) -> tuple[int, bool, float]:
@@ -813,8 +829,23 @@ def ensure_gate_worktree(repo: Repo) -> None:
 # health probe
 # --------------------------------------------------------------------------
 def health_probe(repo: Repo, log_path: Path) -> bool:
-    cmd = repo.health_cmd or repo.deploy_cmd
-    rc = run_shell(cmd, repo.canonical, log_path)
+    """Is prod healthy? A probe that hangs past its hard cap is simply unhealthy.
+
+    Recovery calls this while holding the gate lock, so an unbounded probe would
+    wedge every submission behind it. With no health command configured the
+    probe IS the deploy, so it gets the deploy cap instead of the 5-second one.
+    """
+    cmd = repo.health_cmd
+    timeout = HEALTH_HARD_TIMEOUT_SECONDS
+    reason = HEALTH_TIMEOUT_REASON
+    if not cmd:
+        cmd = repo.deploy_cmd
+        timeout = DEPLOY_HARD_TIMEOUT_SECONDS
+        reason = DEPLOY_TIMEOUT_REASON
+    rc, timed_out = run_shell_timed(cmd, repo.canonical, log_path, timeout)
+    if timed_out:
+        warn(reason + " — treating prod as unhealthy")
+        return False
     return rc == 0
 
 
@@ -1021,19 +1052,20 @@ def write_pending_deploy(repo: Repo, sha: str | None) -> None:
     repo.pending_deploy_path.write_text(sha + "\n")
 
 
-def deploy_now(repo: Repo, sha: str, log_path: Path) -> int:
+def deploy_now(repo: Repo, sha: str, log_path: Path) -> tuple[int, bool]:
     """Run the repo's deploy command at the canonical checkout.
 
     Deploys whatever main currently points at — which, with coalescing on, is
     every gated commit accumulated during the burst, not just this candidate.
     Clears the pending record on success so the state file never claims an
-    undeployed main that is in fact live.
+    undeployed main that is in fact live. Returns (exit code, timed_out); a
+    deploy killed at the hard cap is a failed deploy like any other.
     """
-    rc = run_shell(repo.deploy_cmd, repo.canonical, log_path)
-    if rc == 0:
+    rc, timed_out = run_gate_deploy(repo, log_path)
+    if rc == 0 and not timed_out:
         write_deployed(repo, sha)
         write_pending_deploy(repo, None)
-    return rc
+    return rc, timed_out
 
 
 def flush_pending_deploy(
@@ -1062,11 +1094,20 @@ def flush_pending_deploy(
     if lock is not None:
         lock.set_phase("deploying-pending", branch or "(deferred)")
     say(f"deploying deferred main {short(repo.canonical, tip)} ...")
-    rc = deploy_now(repo, tip, log_path)
-    if rc != 0:
-        journal(repo, "pending_deploy_failed", pending=pending, tip=tip, rc=rc)
+    rc, timed_out = deploy_now(repo, tip, log_path)
+    if rc != 0 or timed_out:
+        journal(
+            repo,
+            "pending_deploy_failed",
+            pending=pending,
+            tip=tip,
+            rc=rc,
+            **({"reason": DEPLOY_TIMEOUT_REASON} if timed_out else {}),
+        )
         warn(
-            f"deferred deploy FAILED (exit {rc}); prod is behind main. log: {log_path}"
+            f"deferred deploy FAILED (exit {rc}"
+            f"{'; ' + DEPLOY_TIMEOUT_REASON if timed_out else ''}); "
+            f"prod is behind main. log: {log_path}"
         )
         return False
     settle_green(repo, tip)
@@ -1101,7 +1142,7 @@ def redeploy(repo: Repo, sha: str, log_path: Path) -> None:
     git(repo.canonical, "checkout", repo.main_branch, check=False)
     with allow_main_updates(repo):
         git(repo.canonical, "reset", "--hard", sha)
-    run_shell(repo.deploy_cmd, repo.canonical, log_path)
+    run_gate_deploy(repo, log_path)
 
 
 def redeploy_detached(repo: Repo, sha: str, log_path: Path) -> None:
@@ -1112,7 +1153,7 @@ def redeploy_detached(repo: Repo, sha: str, log_path: Path) -> None:
     """
     git(repo.canonical, "checkout", "--detach", sha)
     try:
-        run_shell(repo.deploy_cmd, repo.canonical, log_path)
+        run_gate_deploy(repo, log_path)
     finally:
         git(repo.canonical, "checkout", repo.main_branch)
 
@@ -1673,8 +1714,10 @@ def cmd_submit(args) -> int:
                 )
                 return 0
             say("deploying to prod ...")
-            drc = deploy_now(repo, C, log_path)
-            if drc != 0:
+            drc, dtimed_out = deploy_now(repo, C, log_path)
+            if drc != 0 or dtimed_out:
+                if dtimed_out:
+                    say(f"DEPLOY TIMED OUT — {DEPLOY_TIMEOUT_REASON}.")
                 say(
                     f"DEPLOY FAILED (exit {drc}) — rolling back to {short(repo.canonical, M)}"
                 )
@@ -1682,13 +1725,20 @@ def cmd_submit(args) -> int:
                 with allow_main_updates(repo):
                     git(repo.canonical, "reset", "--hard", M)
                 sync_submodules(repo.canonical)
-                run_shell(repo.deploy_cmd, repo.canonical, log_path)
+                run_gate_deploy(repo, log_path)
                 write_deployed(repo, M)
                 # M already contains every commit coalesced before this one, so
                 # rolling back to it deploys exactly "the last successful thing"
                 # and leaves nothing pending.
                 write_pending_deploy(repo, None)
-                journal(repo, "deploy_failed", candidate=C, pre_main=M, rc=drc)
+                journal(
+                    repo,
+                    "deploy_failed",
+                    candidate=C,
+                    pre_main=M,
+                    rc=drc,
+                    **({"reason": DEPLOY_TIMEOUT_REASON} if dtimed_out else {}),
+                )
                 say(f"prod restored to {short(repo.canonical, M)}. branch preserved.")
                 say(f"log: {log_path}")
                 say(log_tail(log_path, 50))
@@ -1793,8 +1843,10 @@ def cmd_adopt(args) -> int:
             # deploy at canonical (already at the main tip)
             lock.set_phase("deploying", "adopt")
             say("deploying to prod ...")
-            drc = run_shell(repo.deploy_cmd, repo.canonical, log_path)
-            if drc != 0:
+            drc, dtimed_out = run_gate_deploy(repo, log_path)
+            if drc != 0 or dtimed_out:
+                if dtimed_out:
+                    say(f"DEPLOY TIMED OUT — {DEPLOY_TIMEOUT_REASON}.")
                 # Prefer the SHA prod actually ran (deployed) over last-green:
                 # after setup --refresh-docs, last-green == tip while deployed
                 # still names the known-good build.
@@ -1808,7 +1860,14 @@ def cmd_adopt(args) -> int:
                     )
                     redeploy_detached(repo, restore, log_path)
                     write_deployed(repo, restore)
-                    journal(repo, "adopt_failed", stage="deploy", candidate=tip, rc=drc)
+                    journal(
+                        repo,
+                        "adopt_failed",
+                        stage="deploy",
+                        candidate=tip,
+                        rc=drc,
+                        **({"reason": DEPLOY_TIMEOUT_REASON} if dtimed_out else {}),
+                    )
                     prod_behind_banner(repo, tip, restore)
                 else:
                     # Bootstrap: there is no previously-deployed SHA to fall
@@ -1822,6 +1881,7 @@ def cmd_adopt(args) -> int:
                         candidate=tip,
                         rc=drc,
                         bootstrap=True,
+                        **({"reason": DEPLOY_TIMEOUT_REASON} if dtimed_out else {}),
                     )
                     prod_unknown_banner(repo, tip)
                 say(f"log: {log_path}")
@@ -1925,9 +1985,18 @@ def cmd_deploy_pending(args) -> int:
             lock.set_phase("deploying-pending", "(deferred)")
             tip = rev(repo.canonical, repo.main_branch)
             say(f"deploying deferred main {short(repo.canonical, tip)} ...")
-            rc = deploy_now(repo, tip, log_path)
-            if rc != 0:
-                journal(repo, "pending_deploy_failed", pending=pending, tip=tip, rc=rc)
+            rc, timed_out = deploy_now(repo, tip, log_path)
+            if rc != 0 or timed_out:
+                journal(
+                    repo,
+                    "pending_deploy_failed",
+                    pending=pending,
+                    tip=tip,
+                    rc=rc,
+                    **({"reason": DEPLOY_TIMEOUT_REASON} if timed_out else {}),
+                )
+                if timed_out:
+                    say(f"DEPLOY TIMED OUT — {DEPLOY_TIMEOUT_REASON}.")
                 say(f"DEPLOY FAILED (exit {rc}). log: {log_path}")
                 say(log_tail(log_path, 50))
                 return 1

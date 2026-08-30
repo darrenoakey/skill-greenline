@@ -101,6 +101,14 @@ loud but never makes a healthy candidate red. Beyond ten minutes, Greenline
 kills the whole process group and fails the submission. Neither threshold has a
 config knob.
 
+`deploy` and `health` are capped too, for the same reason: there is one
+serialized gate, so a command that never returns blocks every agent on the
+machine. **`check` 600s, `deploy` 180s, `health` 5s — all hard, none
+configurable, all kill the whole process group on expiry.** A timed-out deploy
+is a failed deploy and takes the ordinary rollback path; a timed-out health
+probe is simply unhealthy. A `health` command that cannot answer in five seconds
+is measuring the wrong thing — probe a readiness endpoint, do not rebuild.
+
 The remedy is never raising the limit. It is making the suite fast:
 
 - **Parallelize.** The co-design rules above exist so tests can run at once —

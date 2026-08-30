@@ -128,6 +128,42 @@ SLOW_CHECK = textwrap.dedent(
 )
 
 
+# A ./run whose DEPLOY hangs, but only away from a given tree. The deploy that
+# rolls prod back runs at the pre-merge main, whose committed ./run is the fast
+# recorder — so only the candidate's deploy hangs, and the rollback still works.
+SLOW_DEPLOY = textwrap.dedent(
+    """
+    FLAGDIR="$(git rev-parse --git-common-dir)"
+    REC="$FLAGDIR/gl-record.log"
+    echo "$1 $(git rev-parse HEAD) $(pwd)" >> "$REC"
+    if [ "$1" = "deploy" ]; then
+      sleep 120 &
+      child=$!
+      echo "$child" > "$FLAGDIR/slow-child.pid"
+      wait "$child"
+    fi
+    exit 0
+    """
+)
+
+
+# A ./run whose HEALTH probe hangs, with the same reapable grandchild.
+SLOW_HEALTH = textwrap.dedent(
+    """
+    FLAGDIR="$(git rev-parse --git-common-dir)"
+    REC="$FLAGDIR/gl-record.log"
+    echo "$1 $(git rev-parse HEAD) $(pwd)" >> "$REC"
+    if [ "$1" = "health" ]; then
+      sleep 120 &
+      child=$!
+      echo "$child" > "$FLAGDIR/slow-child.pid"
+      wait "$child"
+    fi
+    exit 0
+    """
+)
+
+
 def load_greenline_module():
     """Import the CLI script as a module (it has no .py suffix).
 
@@ -203,7 +239,9 @@ def sha(repo: Path, ref: str) -> str:
     return run_git(repo, "rev-parse", ref)
 
 
-def seed_config(repo: Path, tmp_path: Path, name: str, coalesce: bool = False):
+def seed_config(
+    repo: Path, tmp_path: Path, name: str, coalesce: bool = False, health: str = ""
+):
     """Pre-write greenline.toml with a tmp worktree_base so setup NEVER touches
     /Volumes. setup leaves an existing toml untouched."""
     wtbase = tmp_path / "wt" / name
@@ -212,7 +250,7 @@ def seed_config(repo: Path, tmp_path: Path, name: str, coalesce: bool = False):
         'main_branch = "main"\n'
         'check = "./run check"\n'
         'deploy = "./run deploy"\n'
-        'health = ""\n'
+        f'health = "{health}"\n'
         f'service = "{name}"\n'
         f'worktree_base = "{wtbase}"\n'
         + (f"coalesce_deploys = {'true' if coalesce else 'false'}\n")
@@ -1345,6 +1383,74 @@ def test_slow_adopt_orders_the_adopting_agent(tmp_path, capsys, monkeypatch):
     slow = [e for e in journal_events(repo) if e["event"] == "gate_slow"]
     assert len(slow) == 1 and slow[0]["branch"] == "adopt"
     assert slow[0]["candidate"] == tip
+
+
+# --------------------------------------------------------------------------
+# deploy / health timing contract
+# --------------------------------------------------------------------------
+# There is exactly one serialized gate, so a deploy or health command that never
+# returns blocks every agent on the machine. Both caps are hard and have no
+# user-facing override, so tests patch the module constants in process.
+
+
+def test_deploy_and_health_timeouts_are_three_minutes_and_five_seconds():
+    mod = load_greenline_module()
+    assert mod.DEPLOY_HARD_TIMEOUT_SECONDS == 180
+    assert mod.HEALTH_HARD_TIMEOUT_SECONDS == 5
+
+
+def test_deploy_timeout_rolls_back_like_a_failed_deploy_and_reaps_children(
+    tmp_path, capsys
+):
+    repo = setup_repo(tmp_path, "slowdeploy")
+    main_before = sha(repo, "main")
+    wt = make_worktree(repo, "slow")
+    write_run_script(wt, SLOW_DEPLOY)
+    run_git(wt, "add", "-A")
+    run_git(wt, "commit", "-q", "-m", "slow deploy")
+
+    mod = load_greenline_module()
+    mod.DEPLOY_HARD_TIMEOUT_SECONDS = 2
+    rc = mod.main(["submit", "--repo", str(wt)])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "DEPLOY TIMED OUT" in out
+    assert mod.DEPLOY_TIMEOUT_REASON in out
+
+    # the deploy's grandchild (a bare `sleep`) must have gone with the group
+    child = int((common_dir(repo) / "slow-child.pid").read_text().strip())
+    assert pid_is_gone(child), f"child {child} survived the deploy timeout kill"
+
+    # same semantics as a nonzero deploy: main and prod restored to pre-merge
+    assert sha(repo, "main") == main_before
+    assert sha(repo, "refs/greenline/last-green") == main_before
+    deployed = (common_dir(repo) / "greenline" / "deployed").read_text().strip()
+    assert deployed == main_before
+    assert sha(repo, "gl/slow")  # branch preserved
+
+    last = journal_events(repo)[-1]
+    assert last["event"] == "deploy_failed" and last["pre_main"] == main_before
+    assert last["reason"] == mod.DEPLOY_TIMEOUT_REASON
+
+
+def test_health_probe_timeout_reports_unhealthy(tmp_path):
+    repo = make_repo(tmp_path, "slowhealth", SLOW_HEALTH)
+    seed_config(repo, tmp_path, "slowhealth", health="./run health")
+    gl(repo, "setup", expect=0)
+
+    mod = load_greenline_module()
+    mod.HEALTH_HARD_TIMEOUT_SECONDS = 1
+    loaded = mod.load_repo(repo)
+    log_path = tmp_path / "health.log"
+
+    started = time.monotonic()
+    assert mod.health_probe(loaded, log_path) is False
+    elapsed = time.monotonic() - started
+    assert elapsed < 30, f"health probe ran {elapsed:.1f}s — the cap did not fire"
+
+    assert "timeout after" in log_path.read_text()
+    child = int((common_dir(repo) / "slow-child.pid").read_text().strip())
+    assert pid_is_gone(child), f"child {child} survived the health timeout kill"
 
 
 # --------------------------------------------------------------------------

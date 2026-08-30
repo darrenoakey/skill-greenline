@@ -153,8 +153,10 @@ tail -f submit.log
 greenline calls two scripts in your repo:
 
 - **`./run check`** — run from the gate worktree. Must build, lint, and run the full test suite against a test datastore. Exit code is the verdict. Must be safe to run concurrently from multiple worktrees. Five minutes is a soft budget; successful checks may continue to the 10-minute hard timeout. A 5–10 minute success remains green and, after completion and lock release, greenline tells the submitting agent that making the check fit the budget is its mandatory next task — it is never scheduled or delegated. Beyond 10 minutes the whole check process group is killed and the gate fails.
-- **`./run deploy`** — run from the canonical checkout. Must rebuild and restart production, health-check, and exit nonzero if unhealthy. Must be idempotent.
-- **`./run health`** *(optional)* — a probe with no side effects. If absent, greenline re-runs `deploy` as the health probe.
+- **`./run deploy`** — run from the canonical checkout. Must rebuild and restart production, health-check, and exit nonzero if unhealthy. Must be idempotent. It has a 180-second hard timeout; a deploy killed at the cap fails and rolls back exactly like a nonzero exit.
+- **`./run health`** *(optional)* — a probe with no side effects, under a 5-second hard timeout; a probe that does not answer in time is unhealthy. If absent, greenline re-runs `deploy` as the health probe (under the deploy cap).
+
+All three timeouts — check 600s, deploy 180s, health 5s — are hard, have no config override, and kill the whole process group on expiry.
 
 ## Key rules for agents working in greenline repos
 
