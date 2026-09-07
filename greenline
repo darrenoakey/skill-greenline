@@ -10,10 +10,13 @@ deploy of prod. Stdlib only; no environment-variable configuration.
 from __future__ import annotations
 
 import argparse
+import codecs
 import contextlib
 import fcntl
 import json
+import locale
 import os
+import selectors
 import shutil
 import signal
 import subprocess
@@ -33,12 +36,18 @@ MD_BEGIN = "<!-- >>> greenline >>> -->"
 MD_END = "<!-- <<< greenline <<< -->"
 LAST_GREEN_REF = "refs/greenline/last-green"
 
-# Five minutes is the optimization budget; ten minutes is the hard correctness
-# deadline. Deliberately not user-configurable. Tests patch these module values
-# to exercise both boundaries without sleeping for real minutes.
-CHECK_SOFT_BUDGET_SECONDS = 300
-CHECK_HARD_TIMEOUT_SECONDS = 600
-CHECK_TIMEOUT_REASON = "check exceeded the 10-minute hard timeout"
+# Three minutes is the performance target; ten minutes is the hard correctness
+# deadline for the WHOLE release, starting before lock admission and ending only
+# after publish. The target is a signal, never a reason to reject correct work.
+# Tests patch these module values to exercise both boundaries quickly.
+RELEASE_TARGET_SECONDS = 180
+RELEASE_HARD_TIMEOUT_SECONDS = 600
+RELEASE_TIMEOUT_REASON = "release exceeded its 600-second end-to-end deadline"
+
+# Recovery begins only after a release has failed. It has its own clock so an
+# expired success deadline can never prevent Greenline from restoring prod.
+RECOVERY_HARD_TIMEOUT_SECONDS = 600
+RECOVERY_TIMEOUT_REASON = "release recovery exceeded its separate 600-second deadline"
 
 # Deploy and health get hard deadlines for the same reason: there is exactly one
 # serialized gate, so a command that never returns blocks every agent on the
@@ -52,8 +61,86 @@ HEALTH_TIMEOUT_REASON = "health probe exceeded the 5-second hard timeout"
 SKILL_DIR = Path(__file__).resolve().parent
 TEMPLATE_DIR = SKILL_DIR / "templates"
 DOCTRINE_SRC = SKILL_DIR / "DOCTRINE.md"
+SPEEDUP_CLI = SKILL_DIR / "greenline-speedup"
+SPEEDUP_LAUNCH_OBSERVE_SECONDS = 2
+PROCESS_GROUP_TERM_GRACE_SECONDS = 2
+PROCESS_GROUP_KILL_GRACE_SECONDS = 2
+PROCESS_PIPE_DRAIN_SECONDS = 2
 
 VERBOSE = False
+ACTIVE_RELEASE_DEADLINE: "ReleaseDeadline | None" = None
+
+
+class ReleaseDeadlineExceeded(RuntimeError):
+    pass
+
+
+class ReleaseCancelled(RuntimeError):
+    pass
+
+
+@dataclass
+class ReleaseDeadline:
+    started: float
+    hard_seconds: float
+    reason: str
+
+    @property
+    def expires(self) -> float:
+        return self.started + self.hard_seconds
+
+    def remaining(self) -> float:
+        return self.expires - time.monotonic()
+
+    def require(self, stage: str) -> float:
+        remaining = self.remaining()
+        if remaining <= 0:
+            raise ReleaseDeadlineExceeded(f"{self.reason} during {stage}")
+        return remaining
+
+
+@dataclass(frozen=True)
+class CommandOutcome:
+    returncode: int
+    timeout_reason: str | None = None
+
+    @property
+    def timed_out(self) -> bool:
+        return self.timeout_reason is not None
+
+
+def release_remaining(stage: str) -> float | None:
+    if ACTIVE_RELEASE_DEADLINE is None:
+        return None
+    return ACTIVE_RELEASE_DEADLINE.require(stage)
+
+
+def operation_timeout(stage: str, stage_cap: float | None) -> tuple[float | None, bool]:
+    remaining = release_remaining(stage)
+    if remaining is None:
+        return stage_cap, False
+    if stage_cap is None or remaining < stage_cap:
+        return remaining, True
+    if stage_cap <= remaining:
+        return stage_cap, False
+    return remaining, True
+
+
+@contextlib.contextmanager
+def recovery_deadline():
+    """Give safety recovery a fresh, explicit budget after release failure."""
+    global ACTIVE_RELEASE_DEADLINE
+    previous = ACTIVE_RELEASE_DEADLINE
+    if previous is not None and previous.reason == RECOVERY_TIMEOUT_REASON:
+        yield
+        return
+    ACTIVE_RELEASE_DEADLINE = ReleaseDeadline(
+        time.monotonic(), RECOVERY_HARD_TIMEOUT_SECONDS, RECOVERY_TIMEOUT_REASON
+    )
+    try:
+        yield
+    finally:
+        ACTIVE_RELEASE_DEADLINE = previous
 
 
 # --------------------------------------------------------------------------
@@ -91,9 +178,9 @@ def utcstamp() -> str:
 def git(
     path: str | Path, *args: str, check: bool = True
 ) -> subprocess.CompletedProcess:
-    cmd = ["git", "-C", str(path), *args]
+    cmd = ["git", "-c", "maintenance.auto=false", "-C", str(path), *args]
     vsay("$ " + " ".join(cmd))
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = run_argv(cmd, "git")
     if check and proc.returncode != 0:
         raise GitError(cmd, proc)
     return proc
@@ -113,13 +200,9 @@ def git_out(path: str | Path, *args: str) -> str:
 
 
 def is_git_repo(path: str | Path) -> bool:
-    return (
-        subprocess.run(
-            ["git", "-C", str(path), "rev-parse", "--git-dir"],
-            capture_output=True,
-        ).returncode
-        == 0
-    )
+    return run_argv(
+        ["git", "-C", str(path), "rev-parse", "--git-dir"], "git repository probe"
+    ).returncode == 0
 
 
 def git_common_dir(path: str | Path) -> Path:
@@ -233,40 +316,17 @@ class Repo:
         return self.state_dir / "allow-main"
 
     @property
-    def waiters_dir(self) -> Path:
-        """One file per process currently BLOCKED on the gate lock.
-
-        A submission registers itself here before it starts waiting and removes
-        the file the moment it acquires the lock, so the current holder can ask
-        "is anyone queued behind me?" and coalesce its deploy if so.
-        """
-        return self.state_dir / "waiters"
-
-    @property
     def pending_deploy_path(self) -> Path:
-        """SHA that passed the gate and reached main but has NOT been deployed.
-
-        Only ever set while deploy coalescing is enabled. It is the record that
-        lets a later submission (or an explicit flush) finish the job, and it is
-        what `status`/`doctor` read to report an undeployed main.
-        """
+        """Legacy/interrupted SHA that reached main without deploy attestation."""
         return self.state_dir / "pending-deploy"
-
-    @property
-    def coalesce_deploys(self) -> bool:
-        """Opt-in: skip the deploy when another submission is already queued.
-
-        Default OFF, because it deliberately relaxes greenline's headline
-        invariant (main == deployed == green) for as long as the queue is busy:
-        main can be several gated commits ahead of prod inside a burst. Repos
-        that deploy by restarting a service — where every deploy interrupts live
-        work — turn it on and trade that window for far fewer restarts.
-        """
-        return bool(self.config.get("coalesce_deploys", False))
 
     @property
     def logs_dir(self) -> Path:
         return self.state_dir / "logs"
+
+    @property
+    def speedup_logs_dir(self) -> Path:
+        return self.logs_dir / "speedup"
 
     @property
     def main_branch(self) -> str:
@@ -295,7 +355,6 @@ class Repo:
     def ensure_state(self) -> None:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.logs_dir.mkdir(parents=True, exist_ok=True)
-        self.waiters_dir.mkdir(parents=True, exist_ok=True)
 
 
 def machine_config_path() -> Path:
@@ -386,16 +445,19 @@ def load_repo(start: str | Path | None) -> Repo:
 # lock + status
 # --------------------------------------------------------------------------
 class GateLock:
-    """Exclusive blocking flock; prints status every 30s while waiting."""
+    """The original simple exclusive flock, bounded by the release clock."""
 
     def __init__(self, repo: Repo):
         self.repo = repo
         self.fh = None
         self.slow_gate: dict | None = None
+        self.wait_started: float | None = None
+        self.acquired_at: float | None = None
 
     def __enter__(self):
         self.repo.ensure_state()
         self.fh = open(self.repo.lock_path, "w")
+        self.wait_started = time.monotonic()
         acquired = False
         try:
             fcntl.flock(self.fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -403,38 +465,32 @@ class GateLock:
         except OSError:
             pass
         if not acquired:
-            # Announce the wait BEFORE blocking, so the current holder can see
-            # that work is queued behind it and coalesce its deploy.
-            self._register_waiter()
-            try:
-                self._wait_with_status()
-            finally:
-                self._unregister_waiter()
+            self._wait_with_status()
+        self.acquired_at = time.monotonic()
         return self
 
-    def _register_waiter(self) -> None:
-        self._waiter_path = self.repo.waiters_dir / str(os.getpid())
-        with contextlib.suppress(OSError):
-            self._waiter_path.write_text(utcstamp() + "\n")
-
-    def _unregister_waiter(self) -> None:
-        path = getattr(self, "_waiter_path", None)
-        if path is not None:
-            with contextlib.suppress(FileNotFoundError):
-                path.unlink()
-            self._waiter_path = None
+    @property
+    def queue_seconds(self) -> float:
+        if self.wait_started is None or self.acquired_at is None:
+            return 0.0
+        return self.acquired_at - self.wait_started
 
     def _wait_with_status(self) -> None:
-        say("gate busy — waiting for lock...")
+        say("gate busy — waiting for lock within the 600-second release deadline...")
+        next_status = 0.0
         while True:
-            self._print_holder()
-            deadline = time.time() + 30
-            while time.time() < deadline:
-                try:
-                    fcntl.flock(self.fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    return
-                except OSError:
-                    time.sleep(0.5)
+            remaining = release_remaining("gate lock admission")
+            try:
+                fcntl.flock(self.fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except OSError:
+                pass
+            now = time.monotonic()
+            if now >= next_status:
+                self._print_holder()
+                next_status = now + 30
+            wait_for = 0.1 if remaining is None else min(0.1, remaining)
+            threading.Event().wait(wait_for)
 
     def _print_holder(self) -> None:
         st = read_json(self.repo.status_path) or {}
@@ -503,34 +559,6 @@ def lock_is_held(repo: Repo) -> bool:
             return True
 
 
-def waiters_queued(repo: Repo) -> int:
-    """Count live submissions currently blocked on the gate lock.
-
-    Stale entries (the process died mid-wait) are removed rather than counted:
-    a dead waiter must never convince the holder to skip a deploy that nobody is
-    left to perform.
-    """
-    if not repo.waiters_dir.exists():
-        return 0
-    me = os.getpid()
-    live = 0
-    for entry in repo.waiters_dir.iterdir():
-        try:
-            pid = int(entry.name)
-        except ValueError:
-            with contextlib.suppress(OSError):
-                entry.unlink()
-            continue
-        if pid == me:
-            continue
-        if pid_alive(pid):
-            live += 1
-        else:
-            with contextlib.suppress(OSError):
-                entry.unlink()
-    return live
-
-
 def pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -582,12 +610,8 @@ def journal_entries(repo: Repo) -> list[dict]:
 
 TERMINAL_EVENTS = {
     "complete",
-    # A coalesced deploy is a COMPLETE gate: the candidate was checked, merged
-    # and fast-forwarded onto main, and only the restart was postponed. Without
-    # it here, crash recovery reads the deferred gate as a crash and rolls main
-    # back — silently discarding a commit that already passed the gate.
-    "deploy_deferred",
     "deploy_failed",
+    "rollback_failed",
     "adopt_failed",
     "abandoned",
     "recovered_rollback",
@@ -619,6 +643,50 @@ def last_incomplete_gate(repo: Repo) -> dict | None:
 # --------------------------------------------------------------------------
 # command runner (tee to log)
 # --------------------------------------------------------------------------
+def run_argv(cmd: list[str], stage: str) -> subprocess.CompletedProcess:
+    """Run argv under the active release deadline and reap its process group."""
+    release_remaining(stage)
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        while True:
+            remaining = release_remaining(stage)
+            try:
+                stdout, stderr = proc.communicate(
+                    timeout=None if remaining is None else min(0.1, remaining)
+                )
+                break
+            except subprocess.TimeoutExpired:
+                release_remaining(stage)
+    except BaseException as exc:
+        _kill_process_group(proc)
+        try:
+            stdout, stderr = proc.communicate(timeout=PROCESS_PIPE_DRAIN_SECONDS)
+        except subprocess.TimeoutExpired:
+            for stream in (proc.stdout, proc.stderr):
+                if stream is not None:
+                    stream.close()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=PROCESS_PIPE_DRAIN_SECONDS)
+            stdout, stderr = "", ""
+        if not isinstance(exc, subprocess.TimeoutExpired):
+            raise
+        reason = (
+            ACTIVE_RELEASE_DEADLINE.reason
+            if ACTIVE_RELEASE_DEADLINE is not None
+            else RELEASE_TIMEOUT_REASON
+        )
+        raise ReleaseDeadlineExceeded(
+            f"{reason} during {stage}: {' '.join(cmd)}"
+        ) from exc
+    return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+
+
 def _kill_process_group(proc: subprocess.Popen) -> None:
     """SIGTERM then SIGKILL the child's whole process group.
 
@@ -626,21 +694,42 @@ def _kill_process_group(proc: subprocess.Popen) -> None:
     them running (and holding the gate's stdout pipe open forever). The child
     is a session/group leader (start_new_session=True), so its pid is the pgid.
     """
-    try:
-        pgid = os.getpgid(proc.pid)
-    except ProcessLookupError:
-        return
-    for sig, grace in ((signal.SIGTERM, 5.0), (signal.SIGKILL, 5.0)):
+    # start_new_session=True makes the leader pid the pgid. Do not ask the
+    # kernel for the leader's pgid here: it may exit on SIGTERM while a
+    # TERM-ignoring descendant remains alive in the same group.
+    pgid = proc.pid
+    for sig, maximum_grace in (
+        (signal.SIGTERM, PROCESS_GROUP_TERM_GRACE_SECONDS),
+        (signal.SIGKILL, PROCESS_GROUP_KILL_GRACE_SECONDS),
+    ):
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(pgid, sig)
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            proc.wait(timeout=grace)
-            return
+        remaining = (
+            ACTIVE_RELEASE_DEADLINE.remaining()
+            if ACTIVE_RELEASE_DEADLINE is not None
+            else maximum_grace
+        )
+        grace = max(0.001, min(maximum_grace, remaining))
+        expires = time.monotonic() + grace
+        while time.monotonic() < expires:
+            try:
+                os.killpg(pgid, 0)
+            except ProcessLookupError:
+                return
+            except PermissionError:
+                pass
+            threading.Event().wait(min(0.02, max(0.0, expires - time.monotonic())))
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(timeout=PROCESS_PIPE_DRAIN_SECONDS)
 
 
 def run_shell_timed(
-    cmd: str, cwd: Path, log_path: Path, timeout: float | None = None
-) -> tuple[int, bool]:
+    cmd: str,
+    cwd: Path,
+    log_path: Path,
+    timeout: float | None,
+    timeout_reason: str,
+) -> CommandOutcome:
     """Run a shell command, tee stdout+stderr to log file.
 
     Returns (exit code, timed_out). Strips CLAUDECODE from the child env
@@ -650,6 +739,7 @@ def run_shell_timed(
     env = os.environ.copy()
     env.pop("CLAUDECODE", None)
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    effective_timeout, deadline_limited = operation_timeout(timeout_reason, timeout)
     timed_out = False
     with log_path.open("a") as log:
         log.write(f"\n$ ({cwd}) {cmd}\n")
@@ -661,110 +751,154 @@ def run_shell_timed(
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
             start_new_session=True,
         )
+        if proc.stdout is None:
+            raise RuntimeError(f"{timeout_reason}: child stdout pipe was not created")
+        decoder = codecs.getincrementaldecoder(locale.getpreferredencoding(False))()
+        selector = selectors.DefaultSelector()
+        selector.register(proc.stdout, selectors.EVENT_READ)
+        expires = (
+            time.monotonic() + effective_timeout
+            if effective_timeout is not None
+            else None
+        )
 
-        def pump() -> None:
-            for line in proc.stdout:  # type: ignore[union-attr]
-                log.write(line)
-                if VERBOSE:
-                    sys.stdout.write(line)
+        def emit(data: bytes, final: bool = False) -> None:
+            text = decoder.decode(data, final=final)
+            log.write(text)
+            log.flush()
+            if VERBOSE:
+                sys.stdout.write(text)
+                sys.stdout.flush()
 
-        # Tee on a thread so the wall-clock deadline is enforced even while the
-        # child is silent (a blocking read on stdout would ignore it).
-        reader = threading.Thread(target=pump, daemon=True)
-        reader.start()
         try:
-            proc.wait(timeout=timeout)
+            while selector.get_map():
+                remaining = None if expires is None else expires - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    if timed_out:
+                        raise RuntimeError(
+                            f"{timeout_reason}: process output did not close after group cleanup"
+                        )
+                    timed_out = True
+                    log.write(
+                        f"[timeout after {effective_timeout:.3f}s — killing process group]\n"
+                    )
+                    _kill_process_group(proc)
+                    remaining = PROCESS_PIPE_DRAIN_SECONDS
+                    expires = time.monotonic() + remaining
+                events = selector.select(
+                    0.1 if remaining is None else min(0.1, max(0.0, remaining))
+                )
+                for key, _ in events:
+                    data = os.read(key.fd, 65536)
+                    if data:
+                        emit(data)
+                    else:
+                        emit(b"", final=True)
+                        selector.unregister(key.fileobj)
+                if timed_out and expires is not None and time.monotonic() >= expires:
+                    raise RuntimeError(
+                        f"{timeout_reason}: process output did not close after group cleanup"
+                    )
+            if proc.poll() is None:
+                remaining = None if expires is None else max(0.0, expires - time.monotonic())
+                proc.wait(timeout=remaining)
         except subprocess.TimeoutExpired:
             timed_out = True
-            log.write(f"[timeout after {timeout}s — killing process group]\n")
             _kill_process_group(proc)
-        reader.join(timeout=10)
+        except BaseException:
+            _kill_process_group(proc)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=PROCESS_PIPE_DRAIN_SECONDS)
+            raise
+        finally:
+            selector.close()
+            proc.stdout.close()
         log.write(f"[exit {proc.returncode}]{' (TIMED OUT)' if timed_out else ''}\n")
-    return proc.returncode, timed_out
+    reason = (
+        ACTIVE_RELEASE_DEADLINE.reason
+        if timed_out and deadline_limited and ACTIVE_RELEASE_DEADLINE is not None
+        else None
+    )
+    if timed_out and not deadline_limited:
+        reason = timeout_reason
+    return CommandOutcome(proc.returncode, reason)
 
 
-def run_gate_deploy(repo: Repo, log_path: Path) -> tuple[int, bool]:
-    """Run the repo's deploy at the canonical checkout under its hard timeout.
+def run_gate_deploy(repo: Repo, log_path: Path) -> CommandOutcome:
+    """Run deploy under the aggregate release/recovery clock.
 
-    Returns (exit code, timed_out). Every deploy invocation goes through here —
-    a hung deploy is a failed deploy, and takes whatever rollback path its call
-    site already has for a nonzero exit.
+    Outside either workflow, retain the historical standalone deploy bound.
     """
     return run_shell_timed(
-        repo.deploy_cmd, repo.canonical, log_path, DEPLOY_HARD_TIMEOUT_SECONDS
+        repo.deploy_cmd,
+        repo.canonical,
+        log_path,
+        None if ACTIVE_RELEASE_DEADLINE is not None else DEPLOY_HARD_TIMEOUT_SECONDS,
+        DEPLOY_TIMEOUT_REASON,
     )
 
 
-def run_gate_check(repo: Repo, cwd: Path, log_path: Path) -> tuple[int, bool, float]:
-    """Run the repo's check under the hard correctness time cap.
+def run_gate_check(repo: Repo, cwd: Path, log_path: Path) -> tuple[CommandOutcome, float]:
+    """Run change-impact validation under the aggregate release clock.
 
     Returns (exit code, timed_out, monotonic elapsed seconds). Crossing the
     soft budget is handled only after the whole gate succeeds.
     """
     started = time.monotonic()
-    rc, timed_out = run_shell_timed(
-        repo.check_cmd, cwd, log_path, CHECK_HARD_TIMEOUT_SECONDS
+    outcome = run_shell_timed(
+        repo.check_cmd,
+        cwd,
+        log_path,
+        None if ACTIVE_RELEASE_DEADLINE is not None else RELEASE_HARD_TIMEOUT_SECONDS,
+        RELEASE_TIMEOUT_REASON,
     )
-    return rc, timed_out, time.monotonic() - started
+    return outcome, time.monotonic() - started
 
 
 def check_timeout_banner(log_path: Path) -> None:
-    mins = CHECK_HARD_TIMEOUT_SECONDS / 60
     say("")
     say("=" * 60)
     say(
-        f"CHECK TIMED OUT after {CHECK_HARD_TIMEOUT_SECONDS:.0f}s "
-        f"({mins:g} min) — GATE FAILED."
+        f"CHECK TIMED OUT — {RELEASE_TIMEOUT_REASON}. GATE FAILED."
     )
-    say("The check pipeline has a 5-minute soft budget and a 10-minute hard")
-    say("timeout. There is no config override; make the suite faster (parallelize")
-    say("with isolated")
-    say("namespaces, start from prebuilt fixtures, warm caches, fail fast on")
-    say("build/lint before the slow suites, split monolithic integration tests).")
+    say("The release has one 600-second deadline from invocation through publish.")
+    say("Validate everything this change could break, chosen by change impact;")
+    say("product growth must not make every release validate unrelated behavior.")
     say("Playbook: docs/DOCTRINE.md -> 'The check time budget'.")
     say("=" * 60)
     say(f"log: {log_path}")
 
 
 def slow_gate_directive(seconds: float) -> str:
-    """The mandatory next-task instruction an over-budget gate hands its agent."""
-    budget = f"{CHECK_SOFT_BUDGET_SECONDS:.0f}"
+    """Describe the automatic response to a slow-but-green full release."""
+    budget = f"{RELEASE_TARGET_SECONDS:.0f}"
     return (
-        f"MANDATORY NEXT TASK: this gate was green, but ./run check took "
-        f"{seconds:.1f}s against a {budget}s budget. Before you start anything "
-        f"else, make ./run check finish under {budget}s: measure the slowest "
-        "packages, fix the real production cause, and re-verify. Do NOT weaken, "
-        "skip or shorten tests, extend deadlines, or change the budget. Do NOT "
-        "schedule it, defer it, or hand it to another agent - it is your next "
-        "task."
+        f"NOTE: this release was green, but its full queue-to-publish path took "
+        f"{seconds:.1f}s against the {budget}s target. Greenline automatically "
+        "starts a detached speed-up investigation. It must preserve validation "
+        "of everything the change could break while selecting by change impact; "
+        "it must not grow an exhaustive release suite with the product."
     )
 
 
 def report_slow_gate(
     repo: Repo, branch: str, candidate: str, seconds: float, log_path: Path
 ) -> None:
-    """Tell the submitting agent to optimize, after the lock is released.
-
-    The gate already succeeded, so this must never redden it and must never
-    push the work somewhere else. The agent that ran the slow gate is told in
-    its own output that optimizing the check is its next task; nothing is
-    enqueued, scheduled, or delegated to another process.
-    """
+    """Report and automatically investigate a slow-but-green full release."""
     journal(
         repo,
         "gate_slow",
         branch=branch,
         candidate=candidate,
         seconds=round(seconds, 6),
-        budget_seconds=CHECK_SOFT_BUDGET_SECONDS,
+        target_seconds=RELEASE_TARGET_SECONDS,
     )
     header = (
-        f"SOFT CHECK BUDGET EXCEEDED: {seconds:.3f}s "
-        f"(budget {CHECK_SOFT_BUDGET_SECONDS:.0f}s)."
+        f"RELEASE TARGET EXCEEDED: {seconds:.3f}s "
+        f"(target {RELEASE_TARGET_SECONDS:.0f}s; hard ceiling "
+        f"{RELEASE_HARD_TIMEOUT_SECONDS:.0f}s)."
     )
     directive = slow_gate_directive(seconds)
     with log_path.open("a") as log:
@@ -774,6 +908,81 @@ def report_slow_gate(
     say(header)
     say(directive)
     say("=" * 60)
+    trigger_speedup_task(repo, branch, candidate, seconds, log_path)
+
+
+def trigger_speedup_task(
+    repo: Repo, branch: str, candidate: str, seconds: float, log_path: Path
+) -> None:
+    """Start the detached investigation and report only the outcome observed."""
+    if not SPEEDUP_CLI.exists():
+        journal(repo, "speedup_launch_failed", branch=branch, candidate=candidate)
+        warn(f"greenline-speedup does not exist at {SPEEDUP_CLI}")
+        return
+    speedup_log = repo.speedup_logs_dir / f"{utcnow()}-{branch.replace('/', '_')}.log"
+    speedup_log.parent.mkdir(parents=True, exist_ok=True)
+    args = [
+        sys.executable,
+        str(SPEEDUP_CLI),
+        "--repo",
+        str(repo.canonical),
+        "--branch",
+        branch,
+        "--candidate",
+        candidate,
+        "--seconds",
+        f"{seconds:.3f}",
+        "--budget",
+        f"{RELEASE_TARGET_SECONDS:.3f}",
+        "--hard-timeout",
+        f"{RELEASE_HARD_TIMEOUT_SECONDS:.3f}",
+        "--log",
+        str(log_path),
+    ]
+    with speedup_log.open("w") as out:
+        proc = subprocess.Popen(
+            args,
+            cwd=str(repo.canonical),
+            stdout=out,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        try:
+            rc = proc.wait(timeout=SPEEDUP_LAUNCH_OBSERVE_SECONDS)
+        except subprocess.TimeoutExpired:
+            journal(
+                repo,
+                "speedup_launch_pending",
+                branch=branch,
+                candidate=candidate,
+                pid=proc.pid,
+                log=str(speedup_log),
+            )
+            say(f"  speed-up launcher still running; acceptance pending — log: {speedup_log}")
+            return
+    detail = log_tail(speedup_log, 10)
+    if rc == 0:
+        journal(
+            repo,
+            "speedup_triggered",
+            branch=branch,
+            candidate=candidate,
+            seconds=round(seconds, 6),
+            target_seconds=RELEASE_TARGET_SECONDS,
+            log=str(speedup_log),
+        )
+        say(f"  speed-up investigation accepted — {detail.splitlines()[-1]}")
+    else:
+        journal(
+            repo,
+            "speedup_launch_failed",
+            branch=branch,
+            candidate=candidate,
+            rc=rc,
+            log=str(speedup_log),
+        )
+        warn(f"speed-up investigation launch failed (exit {rc}); log: {speedup_log}")
 
 
 def log_tail(log_path: Path, n: int = 50) -> str:
@@ -842,11 +1051,11 @@ def health_probe(repo: Repo, log_path: Path) -> bool:
         cmd = repo.deploy_cmd
         timeout = DEPLOY_HARD_TIMEOUT_SECONDS
         reason = DEPLOY_TIMEOUT_REASON
-    rc, timed_out = run_shell_timed(cmd, repo.canonical, log_path, timeout)
-    if timed_out:
-        warn(reason + " — treating prod as unhealthy")
+    outcome = run_shell_timed(cmd, repo.canonical, log_path, timeout, reason)
+    if outcome.timed_out:
+        warn(outcome.timeout_reason + " — treating prod as unhealthy")
         return False
-    return rc == 0
+    return outcome.returncode == 0
 
 
 # --------------------------------------------------------------------------
@@ -863,7 +1072,8 @@ def preflight_base(repo: Repo, log_path: Path) -> None:
     # (a) recover from an incomplete gate
     inc = last_incomplete_gate(repo)
     if inc:
-        recover_incomplete(repo, inc, log_path)
+        with recovery_deadline():
+            recover_incomplete(repo, inc, log_path)
 
     # (b) canonical must be clean and on main
     if worktree_is_dirty(repo.canonical):
@@ -1052,20 +1262,19 @@ def write_pending_deploy(repo: Repo, sha: str | None) -> None:
     repo.pending_deploy_path.write_text(sha + "\n")
 
 
-def deploy_now(repo: Repo, sha: str, log_path: Path) -> tuple[int, bool]:
+def deploy_now(repo: Repo, sha: str, log_path: Path) -> CommandOutcome:
     """Run the repo's deploy command at the canonical checkout.
 
-    Deploys whatever main currently points at — which, with coalescing on, is
-    every gated commit accumulated during the burst, not just this candidate.
-    Clears the pending record on success so the state file never claims an
+    Deploys whatever main currently points at. Clears any legacy/interrupted
+    pending record on success so the state file never claims an
     undeployed main that is in fact live. Returns (exit code, timed_out); a
     deploy killed at the hard cap is a failed deploy like any other.
     """
-    rc, timed_out = run_gate_deploy(repo, log_path)
-    if rc == 0 and not timed_out:
+    outcome = run_gate_deploy(repo, log_path)
+    if outcome.returncode == 0 and not outcome.timed_out:
         write_deployed(repo, sha)
         write_pending_deploy(repo, None)
-    return rc, timed_out
+    return outcome
 
 
 def flush_pending_deploy(
@@ -1086,27 +1295,25 @@ def flush_pending_deploy(
     pending = read_pending_deploy(repo)
     if not pending:
         return False
-    if waiters_queued(repo):
-        return False
     tip = rev(repo.canonical, repo.main_branch)
     if not tip:
         return False
     if lock is not None:
         lock.set_phase("deploying-pending", branch or "(deferred)")
     say(f"deploying deferred main {short(repo.canonical, tip)} ...")
-    rc, timed_out = deploy_now(repo, tip, log_path)
-    if rc != 0 or timed_out:
+    outcome = deploy_now(repo, tip, log_path)
+    if outcome.returncode != 0 or outcome.timed_out:
         journal(
             repo,
             "pending_deploy_failed",
             pending=pending,
             tip=tip,
-            rc=rc,
-            **({"reason": DEPLOY_TIMEOUT_REASON} if timed_out else {}),
+            rc=outcome.returncode,
+            **({"reason": outcome.timeout_reason} if outcome.timed_out else {}),
         )
         warn(
-            f"deferred deploy FAILED (exit {rc}"
-            f"{'; ' + DEPLOY_TIMEOUT_REASON if timed_out else ''}); "
+            f"deferred deploy FAILED (exit {outcome.returncode}"
+            f"{'; ' + outcome.timeout_reason if outcome.timed_out else ''}); "
             f"prod is behind main. log: {log_path}"
         )
         return False
@@ -1142,7 +1349,11 @@ def redeploy(repo: Repo, sha: str, log_path: Path) -> None:
     git(repo.canonical, "checkout", repo.main_branch, check=False)
     with allow_main_updates(repo):
         git(repo.canonical, "reset", "--hard", sha)
-    run_gate_deploy(repo, log_path)
+    outcome = run_gate_deploy(repo, log_path)
+    if outcome.returncode != 0 or outcome.timed_out:
+        raise RuntimeError(
+            f"rollback deploy failed rc={outcome.returncode} reason={outcome.timeout_reason}"
+        )
 
 
 def redeploy_detached(repo: Repo, sha: str, log_path: Path) -> None:
@@ -1153,9 +1364,27 @@ def redeploy_detached(repo: Repo, sha: str, log_path: Path) -> None:
     """
     git(repo.canonical, "checkout", "--detach", sha)
     try:
-        run_gate_deploy(repo, log_path)
+        outcome = run_gate_deploy(repo, log_path)
+        if outcome.returncode != 0 or outcome.timed_out:
+            raise RuntimeError(
+                "detached rollback deploy failed "
+                f"rc={outcome.returncode} reason={outcome.timeout_reason}"
+            )
     finally:
         git(repo.canonical, "checkout", repo.main_branch)
+
+
+def rollback_submit(repo: Repo, sha: str, log_path: Path) -> None:
+    """Restore canonical main and prod under a separate recovery deadline."""
+    with recovery_deadline():
+        git(repo.canonical, "checkout", repo.main_branch, check=False)
+        with allow_main_updates(repo):
+            git(repo.canonical, "reset", "--hard", sha)
+        sync_submodules(repo.canonical)
+        redeploy(repo, sha, log_path)
+        write_deployed(repo, sha)
+        set_last_green(repo, sha)
+        write_pending_deploy(repo, None)
 
 
 def prod_behind_banner(repo: Repo, main_sha: str | None, prod_sha: str | None) -> None:
@@ -1189,6 +1418,40 @@ def publish(repo: Repo, sha: str) -> None:
     finally:
         with contextlib.suppress(FileNotFoundError):
             repo.allow_push_path.unlink()
+
+
+def exact_origin_main(repo: Repo) -> str | None:
+    """Read the exact main ref from origin without trusting a tracking ref."""
+    ref = f"refs/heads/{repo.main_branch}"
+    proc = git(repo.canonical, "ls-remote", "--refs", "origin", ref, check=False)
+    if proc.returncode != 0:
+        raise GitError(["git", "ls-remote", "origin", ref], proc)
+    matches = [line.split() for line in proc.stdout.splitlines() if line.strip()]
+    exact = [fields[0] for fields in matches if len(fields) == 2 and fields[1] == ref]
+    if len(exact) > 1:
+        raise RuntimeError(f"origin returned duplicate values for {ref}")
+    return exact[0] if exact else None
+
+
+def reconcile_submit_publish_deadline(
+    repo: Repo, candidate: str, pre_main: str, log_path: Path
+) -> str:
+    """Reconcile a push timeout from exact local, deployed, and remote refs."""
+    with recovery_deadline():
+        origin = exact_origin_main(repo)
+        local = rev(repo.canonical, repo.main_branch)
+        deployed = read_deployed(repo)
+        if origin == candidate and local == candidate and deployed == candidate:
+            set_last_green(repo, candidate)
+            return "candidate_published"
+        if origin == pre_main:
+            rollback_submit(repo, pre_main, log_path)
+            return "pre_release_restored"
+        return (
+            "diverged:"
+            f"origin={origin or 'missing'},local={local or 'missing'},"
+            f"deployed={deployed or 'missing'}"
+        )
 
 
 # --------------------------------------------------------------------------
@@ -1253,6 +1516,15 @@ fi
 while read -r old_value new_value ref_name; do
     case "$ref_name" in
         refs/heads/{main})
+            # Git may report an unchanged ref while packing refs.
+            zero_value="0000000000000000000000000000000000000000"
+            if [ "$old_value" = "$new_value" ] && [ "$old_value" != "$zero_value" ]; then
+                continue
+            fi
+            current_value="$(git rev-parse --verify "$ref_name" 2>/dev/null)"
+            if [ "$old_value" = "$zero_value" ] && [ "$new_value" = "$current_value" ]; then
+                continue
+            fi
             if [ ! -f "{allow}" ]; then
                 echo "greenline: direct update of {main} is forbidden." >&2
                 echo "greenline: work in a worktree (greenline worktree <name>)," >&2
@@ -1575,6 +1847,15 @@ def cmd_worktree(args) -> int:
 def cmd_submit(args) -> int:
     repo = load_repo(args.repo)
     main = repo.main_branch
+    advanced = False
+    publish_attempted = False
+    pre_main: str | None = None
+    candidate: str | None = None
+    release_started = (
+        ACTIVE_RELEASE_DEADLINE.started
+        if ACTIVE_RELEASE_DEADLINE is not None
+        else time.monotonic()
+    )
 
     branch = args.branch
     if not branch:
@@ -1604,6 +1885,7 @@ def cmd_submit(args) -> int:
             preflight_reconcile(repo, log_path)
 
             M = rev(repo.canonical, main)
+            pre_main = M
             src = rev(repo.canonical, branch)
             journal(repo, "start", branch=branch, candidate_src_sha=src, pre_main=M)
 
@@ -1644,35 +1926,47 @@ def cmd_submit(args) -> int:
             msg = f"{branch}: {tip_subject}\n\n{body}\n\nVia: greenline gate"
             git(gate, "commit", "-m", msg)
             C = rev(gate, "HEAD")
+            candidate = C
             sync_submodules(gate)
 
             # check
             lock.set_phase("checking", branch)
             say(f"checking candidate {short(gate, 'HEAD')} ...")
-            rc, timed_out, check_seconds = run_gate_check(repo, gate, log_path)
-            if rc != 0 or timed_out:
+            check_outcome, check_seconds = run_gate_check(repo, gate, log_path)
+            if check_outcome.returncode != 0 or check_outcome.timed_out:
                 journal(
                     repo,
                     "fail",
                     stage="check",
                     branch=branch,
                     candidate=C,
-                    rc=rc,
-                    **({"reason": CHECK_TIMEOUT_REASON} if timed_out else {}),
+                    rc=check_outcome.returncode,
+                    **(
+                        {"reason": check_outcome.timeout_reason}
+                        if check_outcome.timed_out
+                        else {}
+                    ),
                 )
-                git(gate, "reset", "--hard", main)
-                git(gate, "clean", "-fd")
+                cleanup_context = (
+                    recovery_deadline()
+                    if check_outcome.timed_out
+                    else contextlib.nullcontext()
+                )
+                with cleanup_context:
+                    git(gate, "reset", "--hard", main)
+                    git(gate, "clean", "-fd")
                 # This candidate never reached main, but an EARLIER one may have
                 # been merged with its deploy deferred behind us. We are the last
                 # of the burst, so ship that known-good main now instead of
                 # leaving prod behind a commit nobody will come back for.
-                flush_pending_deploy(repo, log_path, lock, branch)
-                if timed_out:
+                if check_outcome.timed_out:
                     check_timeout_banner(log_path)
                     say("main is untouched; branch preserved.")
                 else:
                     say(
-                        f"CHECK FAILED (exit {rc}). main is untouched; branch preserved."
+                        "CHECK FAILED "
+                        f"(exit {check_outcome.returncode}). main is untouched; "
+                        "branch preserved."
                     )
                     say(f"log: {log_path}")
                 say("--- last 50 lines ---")
@@ -1684,75 +1978,78 @@ def cmd_submit(args) -> int:
             lock.set_phase("advancing", branch)
             with allow_main_updates(repo):
                 git(repo.canonical, "merge", "--ff-only", C)
+            advanced = True
             sync_submodules(repo.canonical)
             journal(repo, "ffed", candidate=C, pre_main=M)
 
-            # deploy — unless more work is already queued behind us. Each
-            # deploy restarts prod, so a burst of N submissions used to mean N
-            # restarts; coalescing collapses them into one at the end of the
-            # burst. main is already advanced and green either way, so a
-            # deferred deploy loses nothing but the wait.
+            # Every successful release deploys this exact candidate. The legacy
+            # coalesce_deploys config key is accepted but intentionally ignored.
             lock.set_phase("deploying", branch)
-            queued = waiters_queued(repo) if repo.coalesce_deploys else 0
-            if queued:
-                write_pending_deploy(repo, C)
-                lock.set_phase("publishing", branch)
-                if remote_exists(repo.canonical):
-                    publish(repo, C)
-                set_last_green(repo, C)
-                journal(
-                    repo, "deploy_deferred", candidate=C, branch=branch, queued=queued
-                )
-                say("")
-                say("GATE PASSED (deploy deferred)")
-                say(f"  branch   : {branch}")
-                say(f"  merged   : {short(repo.canonical, C)}")
-                say(f"  deployed : deferred — {queued} submission(s) still queued")
-                say(f"  log      : {log_path}")
-                say(
-                    f"  next     : greenline done   # from {their_wt or 'your worktree'}"
-                )
-                return 0
             say("deploying to prod ...")
-            drc, dtimed_out = deploy_now(repo, C, log_path)
-            if drc != 0 or dtimed_out:
-                if dtimed_out:
-                    say(f"DEPLOY TIMED OUT — {DEPLOY_TIMEOUT_REASON}.")
+            deploy_started = time.monotonic()
+            deploy_outcome = deploy_now(repo, C, log_path)
+            deploy_seconds = time.monotonic() - deploy_started
+            if deploy_outcome.returncode != 0 or deploy_outcome.timed_out:
+                if deploy_outcome.timed_out:
+                    say(f"DEPLOY TIMED OUT — {deploy_outcome.timeout_reason}.")
                 say(
-                    f"DEPLOY FAILED (exit {drc}) — rolling back to {short(repo.canonical, M)}"
+                    "DEPLOY FAILED "
+                    f"(exit {deploy_outcome.returncode}) — rolling back to "
+                    f"{M[:8]}"
                 )
-                git(repo.canonical, "checkout", main, check=False)
-                with allow_main_updates(repo):
-                    git(repo.canonical, "reset", "--hard", M)
-                sync_submodules(repo.canonical)
-                run_gate_deploy(repo, log_path)
-                write_deployed(repo, M)
-                # M already contains every commit coalesced before this one, so
-                # rolling back to it deploys exactly "the last successful thing"
-                # and leaves nothing pending.
-                write_pending_deploy(repo, None)
+                try:
+                    rollback_submit(repo, M, log_path)
+                except Exception as rollback_exc:  # noqa: BLE001
+                    journal(
+                        repo,
+                        "rollback_failed",
+                        candidate=C,
+                        pre_main=M,
+                        rc=deploy_outcome.returncode,
+                        rollback_error=repr(rollback_exc),
+                    )
+                    say(f"ROLLBACK FAILED — {rollback_exc}")
+                    say(f"log: {log_path}")
+                    return 1
+                advanced = False
                 journal(
                     repo,
                     "deploy_failed",
                     candidate=C,
                     pre_main=M,
-                    rc=drc,
-                    **({"reason": DEPLOY_TIMEOUT_REASON} if dtimed_out else {}),
+                    rc=deploy_outcome.returncode,
+                    **(
+                        {"reason": deploy_outcome.timeout_reason}
+                        if deploy_outcome.timed_out
+                        else {}
+                    ),
                 )
-                say(f"prod restored to {short(repo.canonical, M)}. branch preserved.")
+                say(f"prod restored to {M[:8]}. branch preserved.")
                 say(f"log: {log_path}")
                 say(log_tail(log_path, 50))
                 return 1
 
             # publish
             lock.set_phase("publishing", branch)
+            release_remaining("publish")
+            publish_started = time.monotonic()
             if remote_exists(repo.canonical):
+                publish_attempted = True
                 publish(repo, C)
             set_last_green(repo, C)
-            journal(repo, "complete", merged=C, branch=branch)
-            if check_seconds > CHECK_SOFT_BUDGET_SECONDS:
+            publish_seconds = time.monotonic() - publish_started
+            total_seconds = time.monotonic() - release_started
+            timings = {
+                "queue_seconds": round(lock.queue_seconds, 6),
+                "check_seconds": round(check_seconds, 6),
+                "deploy_seconds": round(deploy_seconds, 6),
+                "publish_seconds": round(publish_seconds, 6),
+                "total_seconds": round(total_seconds, 6),
+            }
+            journal(repo, "complete", merged=C, branch=branch, **timings)
+            if total_seconds > RELEASE_TARGET_SECONDS:
                 lock.require_optimization_after_release(
-                    branch, C, check_seconds, log_path
+                    branch, C, total_seconds, log_path
                 )
 
             say("")
@@ -1760,9 +2057,65 @@ def cmd_submit(args) -> int:
             say(f"  branch   : {branch}")
             say(f"  merged   : {short(repo.canonical, C)}")
             say("  deployed : ok")
+            say(
+                "  timings  : "
+                f"queue={timings['queue_seconds']:.3f}s "
+                f"check={timings['check_seconds']:.3f}s "
+                f"deploy={timings['deploy_seconds']:.3f}s "
+                f"publish={timings['publish_seconds']:.3f}s "
+                f"total={timings['total_seconds']:.3f}s"
+            )
             say(f"  log      : {log_path}")
             say(f"  next     : greenline done   # from {their_wt or 'your worktree'}")
             return 0
+        except (ReleaseDeadlineExceeded, ReleaseCancelled) as exc:
+            rollback_error = None
+            reconciliation = None
+            if advanced and pre_main:
+                try:
+                    if publish_attempted and candidate:
+                        reconciliation = reconcile_submit_publish_deadline(
+                            repo, candidate, pre_main, log_path
+                        )
+                        advanced = reconciliation != "pre_release_restored"
+                    else:
+                        rollback_submit(repo, pre_main, log_path)
+                        advanced = False
+                except Exception as rollback_exc:  # noqa: BLE001
+                    rollback_error = repr(rollback_exc)
+            journal(
+                repo,
+                "fail",
+                stage=(
+                    "release_deadline"
+                    if isinstance(exc, ReleaseDeadlineExceeded)
+                    else "release_cancelled"
+                ),
+                branch=branch,
+                candidate=candidate,
+                reason=str(exc),
+                **({"reconciliation": reconciliation} if reconciliation else {}),
+                **({"rollback_error": rollback_error} if rollback_error else {}),
+            )
+            say(f"RELEASE FAILED — {exc}")
+            say(
+                "release failed; recovery ran separately and is not a release success"
+            )
+            if rollback_error:
+                say(f"ROLLBACK FAILED — {rollback_error}")
+            elif reconciliation == "candidate_published":
+                say(
+                    "origin, local main, and deployed attest the candidate; "
+                    "last-green was reconciled without rewinding origin."
+                )
+            elif reconciliation and reconciliation.startswith("diverged:"):
+                say(
+                    "publish outcome diverged; no ref or deployed state was "
+                    f"rewound ({reconciliation})."
+                )
+            else:
+                say("main and prod restored; branch preserved.")
+            return 1
         except SystemExit:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -1779,6 +2132,13 @@ def cmd_adopt(args) -> int:
     main = repo.main_branch
     log_path = repo.logs_dir / f"{utcnow()}-adopt.log"
     lock = GateLock(repo)
+    deployed_before: str | None = None
+    tip: str | None = None
+    release_started = (
+        ACTIVE_RELEASE_DEADLINE.started
+        if ACTIVE_RELEASE_DEADLINE is not None
+        else time.monotonic()
+    )
     with lock:
         try:
             lock.set_phase("preflight", "adopt")
@@ -1789,6 +2149,7 @@ def cmd_adopt(args) -> int:
             tip = rev(repo.canonical, main)
             last_green = rev(repo.canonical, LAST_GREEN_REF)
             deployed = read_deployed(repo)
+            deployed_before = deployed
             if not tip:
                 die(f"no {main} branch to adopt", 2)
             if tip == last_green and deployed == tip:
@@ -1814,23 +2175,28 @@ def cmd_adopt(args) -> int:
             # check at the main tip in the gate worktree
             lock.set_phase("checking", "adopt")
             say(f"checking main tip {short(repo.canonical, tip)} ...")
-            rc, timed_out, check_seconds = run_gate_check(
-                repo, repo.gate_path, log_path
-            )
-            if rc != 0 or timed_out:
+            check_outcome, check_seconds = run_gate_check(repo, repo.gate_path, log_path)
+            if check_outcome.returncode != 0 or check_outcome.timed_out:
                 journal(
                     repo,
                     "adopt_failed",
                     stage="check",
                     candidate=tip,
-                    rc=rc,
-                    **({"reason": CHECK_TIMEOUT_REASON} if timed_out else {}),
+                    rc=check_outcome.returncode,
+                    **(
+                        {"reason": check_outcome.timeout_reason}
+                        if check_outcome.timed_out
+                        else {}
+                    ),
                 )
-                if timed_out:
+                if check_outcome.timed_out:
                     check_timeout_banner(log_path)
                     say("main untouched; prod untouched.")
                 else:
-                    say(f"CHECK FAILED (exit {rc}). main untouched; prod untouched.")
+                    say(
+                        f"CHECK FAILED (exit {check_outcome.returncode}). "
+                        "main untouched; prod untouched."
+                    )
                     say(f"log: {log_path}")
                 say(
                     "Fix the code on main (or revert the offending commits), then re-run"
@@ -1843,10 +2209,12 @@ def cmd_adopt(args) -> int:
             # deploy at canonical (already at the main tip)
             lock.set_phase("deploying", "adopt")
             say("deploying to prod ...")
-            drc, dtimed_out = run_gate_deploy(repo, log_path)
-            if drc != 0 or dtimed_out:
-                if dtimed_out:
-                    say(f"DEPLOY TIMED OUT — {DEPLOY_TIMEOUT_REASON}.")
+            deploy_started = time.monotonic()
+            deploy_outcome = run_gate_deploy(repo, log_path)
+            deploy_seconds = time.monotonic() - deploy_started
+            if deploy_outcome.returncode != 0 or deploy_outcome.timed_out:
+                if deploy_outcome.timed_out:
+                    say(f"DEPLOY TIMED OUT — {deploy_outcome.timeout_reason}.")
                 # Prefer the SHA prod actually ran (deployed) over last-green:
                 # after setup --refresh-docs, last-green == tip while deployed
                 # still names the known-good build.
@@ -1855,33 +2223,43 @@ def cmd_adopt(args) -> int:
                 )
                 if restore:
                     say(
-                        f"DEPLOY FAILED (exit {drc}) — restoring prod to last-green"
+                        f"DEPLOY FAILED (exit {deploy_outcome.returncode}) — "
+                        "restoring prod to last-green"
                         " (main is NOT reset; those commits are preserved)."
                     )
-                    redeploy_detached(repo, restore, log_path)
+                    with recovery_deadline():
+                        redeploy_detached(repo, restore, log_path)
                     write_deployed(repo, restore)
                     journal(
                         repo,
                         "adopt_failed",
                         stage="deploy",
                         candidate=tip,
-                        rc=drc,
-                        **({"reason": DEPLOY_TIMEOUT_REASON} if dtimed_out else {}),
+                        rc=deploy_outcome.returncode,
+                        **(
+                            {"reason": deploy_outcome.timeout_reason}
+                            if deploy_outcome.timed_out
+                            else {}
+                        ),
                     )
                     prod_behind_banner(repo, tip, restore)
                 else:
                     # Bootstrap: there is no previously-deployed SHA to fall
                     # back to, so a rollback deploy would be theatre — it would
                     # re-run the same failing command on the same tree.
-                    say(f"DEPLOY FAILED (exit {drc}).")
+                    say(f"DEPLOY FAILED (exit {deploy_outcome.returncode}).")
                     journal(
                         repo,
                         "adopt_failed",
                         stage="deploy",
                         candidate=tip,
-                        rc=drc,
+                        rc=deploy_outcome.returncode,
                         bootstrap=True,
-                        **({"reason": DEPLOY_TIMEOUT_REASON} if dtimed_out else {}),
+                        **(
+                            {"reason": deploy_outcome.timeout_reason}
+                            if deploy_outcome.timed_out
+                            else {}
+                        ),
                     )
                     prod_unknown_banner(repo, tip)
                 say(f"log: {log_path}")
@@ -1891,21 +2269,66 @@ def cmd_adopt(args) -> int:
 
             # publish
             lock.set_phase("publishing", "adopt")
+            release_remaining("publish")
+            publish_started = time.monotonic()
             if remote_exists(repo.canonical):
                 publish(repo, tip)
             set_last_green(repo, tip)
-            journal(repo, "complete", merged=tip, adopt=True, branch="adopt")
-            if check_seconds > CHECK_SOFT_BUDGET_SECONDS:
+            publish_seconds = time.monotonic() - publish_started
+            total_seconds = time.monotonic() - release_started
+            timings = {
+                "queue_seconds": round(lock.queue_seconds, 6),
+                "check_seconds": round(check_seconds, 6),
+                "deploy_seconds": round(deploy_seconds, 6),
+                "publish_seconds": round(publish_seconds, 6),
+                "total_seconds": round(total_seconds, 6),
+            }
+            journal(
+                repo, "complete", merged=tip, adopt=True, branch="adopt", **timings
+            )
+            if total_seconds > RELEASE_TARGET_SECONDS:
                 lock.require_optimization_after_release(
-                    "adopt", tip, check_seconds, log_path
+                    "adopt", tip, total_seconds, log_path
                 )
 
             say("")
             say("ADOPTED")
             say(f"  merged   : {short(repo.canonical, tip)} (main tip, gated in place)")
             say("  deployed : ok")
+            say(
+                "  timings  : "
+                f"queue={timings['queue_seconds']:.3f}s "
+                f"check={timings['check_seconds']:.3f}s "
+                f"deploy={timings['deploy_seconds']:.3f}s "
+                f"publish={timings['publish_seconds']:.3f}s "
+                f"total={timings['total_seconds']:.3f}s"
+            )
             say(f"  log      : {log_path}")
             return 0
+        except ReleaseDeadlineExceeded as exc:
+            rollback_error = None
+            if deployed_before and deployed_before != tip:
+                try:
+                    with recovery_deadline():
+                        redeploy_detached(repo, deployed_before, log_path)
+                        write_deployed(repo, deployed_before)
+                except Exception as rollback_exc:  # noqa: BLE001
+                    rollback_error = repr(rollback_exc)
+            journal(
+                repo,
+                "adopt_failed",
+                stage="release_deadline",
+                candidate=tip,
+                reason=str(exc),
+                **({"rollback_error": rollback_error} if rollback_error else {}),
+            )
+            say(f"RELEASE DEADLINE FAILED — {exc}")
+            say(
+                "release failed; recovery ran separately and is not a release success"
+            )
+            if rollback_error:
+                say(f"ROLLBACK FAILED — {rollback_error}")
+            return 1
         except SystemExit:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -1967,12 +2390,7 @@ def cmd_done(args) -> int:
 
 
 def cmd_deploy_pending(args) -> int:
-    """Ship a deploy that coalescing deferred and nobody came back for.
-
-    The normal case needs no one to run this: the last submission of a burst
-    sees an empty queue and deploys. This exists for the abnormal one — the last
-    submission was killed mid-gate — and as the manual escape hatch.
-    """
+    """Recover a legacy or interrupted main lacking deploy attestation."""
     repo = load_repo(args.repo)
     pending = read_pending_deploy(repo)
     if not pending:
@@ -1985,19 +2403,19 @@ def cmd_deploy_pending(args) -> int:
             lock.set_phase("deploying-pending", "(deferred)")
             tip = rev(repo.canonical, repo.main_branch)
             say(f"deploying deferred main {short(repo.canonical, tip)} ...")
-            rc, timed_out = deploy_now(repo, tip, log_path)
-            if rc != 0 or timed_out:
+            outcome = deploy_now(repo, tip, log_path)
+            if outcome.returncode != 0 or outcome.timed_out:
                 journal(
                     repo,
                     "pending_deploy_failed",
                     pending=pending,
                     tip=tip,
-                    rc=rc,
-                    **({"reason": DEPLOY_TIMEOUT_REASON} if timed_out else {}),
+                    rc=outcome.returncode,
+                    **({"reason": outcome.timeout_reason} if outcome.timed_out else {}),
                 )
-                if timed_out:
-                    say(f"DEPLOY TIMED OUT — {DEPLOY_TIMEOUT_REASON}.")
-                say(f"DEPLOY FAILED (exit {rc}). log: {log_path}")
+                if outcome.timed_out:
+                    say(f"DEPLOY TIMED OUT — {outcome.timeout_reason}.")
+                say(f"DEPLOY FAILED (exit {outcome.returncode}). log: {log_path}")
                 say(log_tail(log_path, 50))
                 return 1
             settle_green(repo, tip)
@@ -2033,11 +2451,7 @@ def cmd_status(args) -> int:
         origin_s = short(canon, o) if o else "-"
     pending = read_pending_deploy(repo)
     if pending:
-        # Not drift: a burst is in progress and the deploy was deliberately
-        # coalesced. Naming it stops an operator chasing a phantom fault — and
-        # it outranks "OK", because a pending record left behind after the shas
-        # already agree still means someone must clear it.
-        verdict = "DEPLOY DEFERRED"
+        verdict = "DEPLOY UNATTESTED"
     elif main_sha == lg == dep_s:
         verdict = "OK"
     else:
@@ -2046,10 +2460,9 @@ def cmd_status(args) -> int:
         f"shas     : main={main_sha} origin={origin_s} last-green={lg} deployed={dep_s}  [{verdict}]"
     )
     if pending:
-        queued = waiters_queued(repo)
         say(
             f"pending  : {short(canon, pending)} gated but not deployed"
-            f" ({queued} submission(s) queued; `greenline deploy-pending` ships it now)"
+            " (`greenline deploy-pending` must recover it)"
         )
 
     entries = journal_entries(repo)
@@ -2096,14 +2509,11 @@ def _doctor_report(repo: Repo) -> bool:
     )
     pending = read_pending_deploy(repo)
     if pending:
-        # A coalesced deploy is a deliberate, recorded state, not a fault. It
-        # stops being acceptable only once nothing is queued to finish it.
-        queued = waiters_queued(repo)
         check(
-            "deferred deploy has an owner",
-            queued > 0,
-            f"main={short(canon, main)} deployed={short(canon, dep) if dep else '-'};"
-            f" nothing queued — run `greenline deploy-pending`",
+            "no unattested deploy",
+            False,
+            f"main={short(canon, main)} deployed={short(canon, dep) if dep else '-'}; "
+            "run `greenline deploy-pending`",
         )
     elif dep:
         check(
@@ -2186,7 +2596,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_done)
 
     sp = sub.add_parser(
-        "deploy-pending", help="deploy a gated main whose deploy was coalesced away"
+        "deploy-pending", help="recover a main that lacks deploy attestation"
     )
     add_repo(sp)
     sp.set_defaults(func=cmd_deploy_pending)
@@ -2203,18 +2613,42 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    global VERBOSE
+    global ACTIVE_RELEASE_DEADLINE, VERBOSE
+    invoked = time.monotonic()
     parser = build_parser()
     args = parser.parse_args(argv)
     VERBOSE = args.verbose
+    release_command = args.cmd in {"submit", "adopt", "deploy-pending"}
+    previous_sigterm = None
+    if release_command:
+        ACTIVE_RELEASE_DEADLINE = ReleaseDeadline(
+            invoked, RELEASE_HARD_TIMEOUT_SECONDS, RELEASE_TIMEOUT_REASON
+        )
+        if threading.current_thread() is threading.main_thread():
+            previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+            def cancel_release(_signum, _frame) -> NoReturn:
+                raise ReleaseCancelled("release cancelled by SIGTERM")
+
+            signal.signal(signal.SIGTERM, cancel_release)
     try:
         return args.func(args)
+    except ReleaseDeadlineExceeded as exc:
+        warn(f"RELEASE DEADLINE FAILED — {exc}")
+        return 1
+    except ReleaseCancelled as exc:
+        warn(f"RELEASE CANCELLED — {exc}")
+        return 1
     except GitError as e:
         die(str(e), 2)
     except SystemExit:
         raise
     except KeyboardInterrupt:
         die("interrupted", 1)
+    finally:
+        if previous_sigterm is not None:
+            signal.signal(signal.SIGTERM, previous_sigterm)
+        ACTIVE_RELEASE_DEADLINE = None
 
 
 if __name__ == "__main__":

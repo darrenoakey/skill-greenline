@@ -2,8 +2,8 @@
 """greenline-speedup — launch the agentic-high task that fixes a slow gate.
 
 Invoked by greenline itself (see trigger_speedup_task in the `greenline`
-script) immediately after a gate PASSES with `./run check` over its soft
-time budget — never on a failed or timed-out check. It never runs the fix
+script) immediately after a gate PASSES but its full queue-to-publish release
+exceeds the 180-second target — never on a failed or timed-out release. It never runs the fix
 itself: it puts a fresh greenline worktree in place and hands the real work
 to a dedicated agentd3 conversation (model "agentic-high", source
 "greenline-speedup"), then gets out of the way. Safe to run by hand for the
@@ -135,35 +135,38 @@ user request.
 
 Repo: {repo_name}
 Trigger: candidate {branch} ({candidate_short}) passed the greenline gate, but \
-`./run check` took {seconds:.1f}s — over one third of the gate's absolute \
-failure timeout (soft budget {budget:.0f}s, hard timeout {hard_timeout:.0f}s). \
+the full queue-to-publish release took {seconds:.1f}s — over the \
+{budget:.0f}s performance target (hard correctness ceiling {hard_timeout:.0f}s). \
 The gate is GREEN and the change already landed on main; nothing is broken \
-and nothing needs reverting. Your job is speed, not correctness.
+and nothing needs reverting. Your job is release speed without sacrificing \
+correctness.
 
 You are already inside a fresh greenline worktree for this repo — this \
-directory is it. Read this repo's docs/DOCTRINE.md, section "The check time \
+directory is it. Read this repo's docs/DOCTRINE.md, section "The release time \
 budget", for the house rules before you start.
 
 {log_line}
 Do:
-1. Read the log above and find out where the time actually went (build? \
-lint? a specific slow package or suite? cold caches? something serialized \
-that should be parallel?).
-2. Fix the real cause in this worktree: parallelize, warm/reuse caches, seed \
-fixtures instead of rebuilding the world, split monolithic integration \
-tests, record/replay external calls — whatever actually applies. Do NOT \
-weaken, skip, or shorten tests, extend deadlines, or ask for the budget to \
-be raised — those are explicitly forbidden, for you the same as for anyone \
-else.
-3. Run ./run check locally and confirm it finishes comfortably under \
-{budget:.0f}s.
-4. `greenline submit` this branch through the normal gate — it serializes, \
-so wait if it's busy.
+1. Use the release timings and log to find where queue, validation, deploy, or \
+publish time actually went.
+2. Keep every validation the change could break, selected from its actual \
+impact. Do not run an exhaustive ever-growing product suite on every release; \
+product growth must not increase release time. Improve dependency/impact \
+selection first, then parallelism, caches, fixtures, and recorded real outcomes \
+where the evidence points.
+3. Land the smallest coherent, verified, measured improvement immediately, then \
+continue toward the full speed goal. Do NOT weaken relevant validation or extend \
+the {hard_timeout:.0f}s ceiling.
+4. `greenline submit` this branch through the normal gate using one \
+candidate-correlated attempt. A normal release targets 180 seconds. At five \
+minutes inspect the active stage and process tree; at ten minutes terminate and \
+reap the attempt, fix the measured cause, and submit the corrected candidate. \
+Never wait for load, rearm a TTL, or retry unchanged.
 5. `greenline done` once it lands.
 
-If you cannot get it under budget in one pass, land whatever real \
-improvement you found anyway (submit it — a partial win still helps) and \
-leave a clear note in the commit message about what is left.
+Do not declare the speed-up complete while the measured cause persists. Small \
+landed improvements are release boundaries, not a reduced completion criterion: \
+keep going until the release meets the target.
 """
 
 
@@ -217,8 +220,8 @@ def main(argv: list[str] | None = None) -> int:
         "cwd": str(wt),
         "policy": "yolo",
         "title": (
-            f"greenline speedup: {repo_name} check ran {args.seconds:.0f}s "
-            f"(budget {args.budget:.0f}s)"
+            f"greenline speedup: {repo_name} release ran {args.seconds:.0f}s "
+            f"(target {args.budget:.0f}s)"
         ),
         "source": SOURCE,
         "idempotency_key": idempotency_key,
@@ -227,8 +230,8 @@ def main(argv: list[str] | None = None) -> int:
             "actor": "greenline",
             "ref": origin_ref,
             "detail": (
-                f"check took {args.seconds:.1f}s vs {args.budget:.0f}s soft budget "
-                f"(hard timeout {args.hard_timeout:.0f}s)"
+                f"release took {args.seconds:.1f}s vs {args.budget:.0f}s target "
+                f"(hard ceiling {args.hard_timeout:.0f}s)"
             ),
         },
     }

@@ -3,7 +3,7 @@
 This repo uses **greenline**: a local, serialized, gated CI/CD tool. There is one
 canonical checkout of `{reponame}`; it is always on `{main_branch}`, always clean,
 and always identical to what prod (`{service}`) runs. Every change reaches
-`{main_branch}` through a single quality gate that runs the full test suite and a
+`{main_branch}` through a single quality gate that runs change-impact validation and a
 real production deploy, one submission at a time.
 
 ## The workflow
@@ -39,28 +39,47 @@ Under an exclusive lock (other submits queue behind it):
    confirm the canonical checkout is clean and on `{main_branch}`; reconcile
    `{main_branch}`/last-green/origin; reset the gate worktree to the main tip.
 2. **Squash-merge** your branch in the gate worktree. Conflict or empty diff → fail fast.
-3. **Check** — run `{check}` with cwd = the gate worktree. **5 minutes is a soft
-   budget; 10 minutes is the hard timeout.** A successful 5–10 minute check stays
-   green, and once the completed gate releases its lock greenline tells the
-   submitting agent that making the check fit the budget is its mandatory next
-   task — never scheduled, deferred, or delegated. Beyond 10 minutes the whole
-   process group is killed and main remains untouched. See docs/DOCTRINE.md,
-   "The check time budget".
+3. **Check** — run `{check}` with cwd = the gate worktree. It validates every
+   behavior the change could break, selected by changed paths and transitive impact.
 4. **Advance** — fast-forward the canonical `{main_branch}` to the candidate.
 5. **Deploy** — run `{deploy}` with cwd = the canonical checkout. Nonzero → **automatic rollback**: main resets to the previous commit and `{deploy}` re-runs to restore prod.
 6. **Publish** — push `{main_branch}` to origin (via a one-shot allow-push flag the pre-push hook honours) and advance `last-green`.
 
+## Release small, keep going
+
+Choose the smallest coherent, useful change, validate its relevant impact, and
+release it immediately; then take the next chunk. Prioritize a working, deployed
+fix for any reported production blocker. Do not broaden ready-to-ship scope or
+bundle speculative improvements. A release boundary is never a permission pause:
+continue the whole authorized goal without asking. Impact selection must become
+smarter as the product grows so growth does not increase release latency.
+
 ## The contract (you must implement in `./run`)
 
-- **`{check}`** — cwd = the worktree being gated. Build + lint + FULL tests against a
-  **test** datastore. Exit code is the verdict. Must run concurrently from multiple
-  worktrees. Five minutes is the soft budget and 10 minutes is the hard timeout
-  (no override); a successful soft-budget breach stays green and directs the
-  submitting agent to optimize the check as its next task.
+- **`{check}`** — cwd = the worktree being gated. Start with all useful, relevant
+  verification that fits in three minutes, then use changed paths and transitive
+  impact to prove the selection covers every behavior the candidate could affect
+  against a **test** datastore. Preserve relevant coverage; run broader or external
+  suites only when intentionally relevant. Product growth must not increase standard
+  release time. Exit code is the verdict. Must run concurrently from multiple worktrees.
 - **`{deploy}`** — cwd = the canonical checkout. Rebuild/restart prod (e.g.
   `auto -q restart {service}`), **health-check**, exit nonzero on unhealthy, and be
   **idempotent** (rollback re-runs it).
 - **`./run health`** *(optional)* — probe only. If absent, greenline re-runs `{deploy}` as the health probe.
+
+The full release normally averages and targets 180 seconds and has one monotonic
+600-second loaded-machine worst-case hard deadline covering admission, reconcile,
+check, deploy, publish, and attestation. At five minutes, investigate the active
+stage immediately. At ten minutes, terminate and reap the attempt, then fix its
+cause before submitting again—never wait for load, rearm a TTL watcher, or retry
+unchanged. Avoid narrower inner timeouts that falsely fail useful work while
+aggregate time remains.
+Release stages may use the actual time remaining; there are no narrower arbitrary
+caps. Recovery begins only after failure under a separate bound and is never called
+release success. Every successful submission deploys; legacy `coalesce_deploys`
+config is ignored. Queue/check/deploy/publish/total timings are journaled and
+printed; a green total over 180 seconds automatically launches a detached speed-up
+investigation after unlock, and acceptance is reported only after its tool proves it.
 
 ## Test/code co-design (from docs/DOCTRINE.md — read it)
 

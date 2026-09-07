@@ -8,23 +8,13 @@ run for real, in parallel, against live prod.**
 ## The five invariants
 
 1. **`main` == deployed == green, always.** Every commit on `main` has passed the
-   full `check` suite and been deployed healthy. There is no "deployed but
+   release validation selected for that change and been deployed healthy. There is no "deployed but
    untested" state. `last-green` records the last commit that passed the whole
    gate; `deployed` records the SHA prod runs.
 
-   **The one sanctioned exception: `coalesce_deploys`.** A repo whose deploy
-   restarts a service pays a real cost per deploy — in agentd3, 15 deploys in one
-   day interrupted ~20% of all agent turns mid-work. With `coalesce_deploys =
-   true`, a submission that finds other submissions already queued behind it
-   skips only the DEPLOY; it still merges and fast-forwards main, and the last
-   member of the burst deploys the accumulated tip. So "merged but not deployed"
-   becomes a real, bounded, recorded state: bounded because it lasts only while
-   the queue is busy, and recorded because `pending-deploy` names the SHA,
-   `status` reports `DEPLOY DEFERRED`, and `doctor` fails if nothing is queued to
-   finish the job. Every commit is still individually gated — only the restart is
-   shared. Never enable it to paper over slow deploys; enable it only where a
-   deploy interrupts live work.
-   They agree with `main` or the repo is in drift and `doctor` says so.
+   There is no queued-load exception: a successful submission attests its own
+   deploy before returning. The legacy `coalesce_deploys` config key is accepted
+   for compatibility but ignored.
 
 2. **The canonical checkout is pristine.** It lives at the repo root (the parent of
    the shared git dir). It is always on `main`, always clean. **No human and no
@@ -47,6 +37,15 @@ run for real, in parallel, against live prod.**
 5. **Test data never touches prod datastores.** `check` runs against a test
    datastore; `deploy` touches prod. The two never cross. A test that writes to the
    prod store is a bug in the test, not a flaky gate.
+
+## Release small, keep going
+
+Choose the smallest coherent, useful change, validate its relevant impact, and
+release it immediately; then take the next chunk. Prioritize a working, deployed
+fix for any reported production blocker. Do not broaden ready-to-ship scope or
+bundle speculative improvements. A release boundary is never a permission pause:
+continue the whole authorized goal without asking. Impact selection must become
+smarter as the product grows so growth does not increase release latency.
 
 ## Test/code co-design
 
@@ -87,29 +86,46 @@ the tests themselves are designed **together** to survive this environment:
   summary constraint that all the above serve. If two agents cannot both run
   `./run check` at the same moment without interfering, the check is broken.
 
-## The check time budget
+## The release time budget
 
-**Five minutes is the soft `check` budget; ten minutes is the hard timeout.** A
-successful check at or below five minutes passes normally. A successful check
-after five but within ten minutes also passes; after deploy, publish, and
-`last-green` are complete and the gate lock is released, Greenline tells the
-agent that ran it, in that submission's own output, that making the check fit
-the budget is its MANDATORY NEXT TASK. Nothing is scheduled, queued, or handed
-to another agent: the agent who paid the slow gate fixes it before doing
-anything else. That report is best-effort — a failure to print or journal it is
-loud but never makes a healthy candidate red. Beyond ten minutes, Greenline
-kills the whole process group and fails the submission. Neither threshold has a
-config knob.
+**A normal complete release averages and targets 180 seconds; 600 seconds is the
+loaded-machine worst-case hard failure deadline, not the target.** That one
+monotonic deadline runs from command invocation through publish. Lock admission, crash reconcile,
+candidate construction, change-impact validation, deploy, publish, and
+completion attestation all consume that same clock. The 180-second target is a
+performance signal only: crossing it never rejects a release that completes
+correctly before 600 seconds. The ordinary flock stays deliberately simple;
+there is no FIFO scheduler, load gate, coalesced success, or deferred deploy.
 
-`deploy` and `health` are capped too, for the same reason: there is one
-serialized gate, so a command that never returns blocks every agent on the
-machine. **`check` 600s, `deploy` 180s, `health` 5s — all hard, none
-configurable, all kill the whole process group on expiry.** A timed-out deploy
-is a failed deploy and takes the ordinary rollback path; a timed-out health
-probe is simply unhealthy. A `health` command that cannot answer in five seconds
-is measuring the wrong thing — probe a readiness endpoint, do not rebuild.
+Release stages do not carry narrower arbitrary caps: each may use the actual
+time remaining in the aggregate 600-second budget. A timeout kills and reaps the
+whole subprocess group, records a terminal release failure, and never labels the
+expired release successful. Recovery then starts under its own separately
+bounded clock, so an expired success deadline cannot cut off restoration of the
+previous deployed version. Recovery success is reported only as recovery, never
+as release success. A standalone `health` command remains capped at five seconds
+because a readiness probe must be a probe, not a build.
 
-The remedy is never raising the limit. It is making the suite fast:
+Every successful release journals and prints queue, check, deploy, publish, and
+total timings. A total over 180 seconds stays green and automatically starts a
+detached `greenline-speedup` investigation after the lock is released. Greenline
+reports whether that investigation was accepted, failed to launch, or is still
+pending; merely creating a launcher process is never reported as acceptance.
+
+At five minutes, immediately inspect the active stage and its process tree: the
+release is already far outside its normal envelope. Do not wait for machine load,
+start a TTL watcher, or rearm the attempt. At 600 seconds greenline terminates and
+reaps that attempt. Diagnose and fix the cause before a new submission; never
+retry an unchanged candidate merely because the machine may be quieter.
+
+Validation design starts with **all useful, relevant verification we can fit in
+three minutes**. Dependency and ownership maps, changed-file selection, and
+transitive impact analysis must then prove that the selected validation is
+complete for behavior the candidate could affect. Preserve existing coverage
+where it remains relevant; run broader or external suites only when the change
+makes them intentionally relevant. Product growth must not increase standard
+release time. Do not create false failures with inner stage or operation timeouts
+shorter than the remaining release budget. The remaining remedies are:
 
 - **Parallelize.** The co-design rules above exist so tests can run at once —
   isolated schemas, namespaces, ports and temp dirs per test mean nothing has to
@@ -119,8 +135,9 @@ The remedy is never raising the limit. It is making the suite fast:
 - **Keep the build warm.** The gate worktree is persistent on purpose: leave
   build/dependency caches (`target/`, `.venv`, node_modules, record/replay
   caches) in place so a submission compiles only its own diff.
-- **Validate incrementally.** Cheap and decisive first — compile, then lint,
-  then unit, then integration. Fail fast before paying for the slow stages.
+- **Validate by impact.** Select the affected build, lint, unit, integration,
+  migration, and UI checks from the changed paths and their transitive consumers.
+  Cheap and decisive checks run first; unrelated product areas do not run.
 - **Split monolithic integration tests.** One 4-minute end-to-end test is a
   single-threaded wall; several focused ones run concurrently.
 - **Cache the external world** — see the next section.
@@ -160,9 +177,10 @@ in the key. Reference implementation: darrennn's `src/darrennn/endpoint_health.p
 
 ## The contract
 
-- **`./run check`** — cwd = the worktree being gated. Builds, lints, and runs the
-  FULL test suite against a TEST datastore. Its **exit code is the verdict** (0 =
-  green). Must be safe to run concurrently from multiple worktrees.
+- **`./run check`** — cwd = the worktree being gated. Builds, lints, and runs all
+  validation selected by the candidate's real change impact against a TEST
+  datastore. Its **exit code is the verdict** (0 = green). Must be safe to run
+  concurrently from multiple worktrees.
 
 - **`./run deploy`** — cwd = the canonical checkout. Rebuilds and restarts prod
   (e.g. `auto -q restart <svc>`). It **MUST health-check and exit nonzero on

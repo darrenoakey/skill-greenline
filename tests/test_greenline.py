@@ -13,12 +13,16 @@ import os
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from pathlib import Path
 from contextlib import contextmanager
 
 
 GREENLINE = str(Path(__file__).resolve().parent.parent / "greenline")
+GREENLINE_WAIT = str(
+    Path(__file__).resolve().parent.parent / "scripts" / "greenline-wait.sh"
+)
 
 
 # --------------------------------------------------------------------------
@@ -550,10 +554,19 @@ def test_check_failure_leaves_main_untouched(tmp_path):
 
 def test_deploy_failure_rolls_back(tmp_path):
     repo = setup_repo(tmp_path)
+    candidate_only_failure = RUN_RECORDER.replace(
+        "deploy)\n",
+        "deploy)\n        [ -f d.txt ] && { echo candidate deploy failed >&2; exit 7; }\n",
+        1,
+    )
+    write_run_script(repo, candidate_only_failure)
+    with with_main_unlocked(repo):
+        run_git(repo, "add", "run")
+        run_git(repo, "commit", "-q", "-m", "candidate-specific deploy check")
+    run_git(repo, "update-ref", "refs/greenline/last-green", "main")
     M = sha(repo, "main")
     wt = make_worktree(repo, "deploybad")
     commit_in(wt, "d.txt", "z\n", "change")
-    (common_dir(repo) / "FAIL_DEPLOY").write_text("")
     p = gl(repo, "submit", "--repo", str(wt))
     assert p.returncode == 1
     assert "DEPLOY FAILED" in p.stdout
@@ -649,6 +662,48 @@ def test_serialization_second_blocks_until_first_done(tmp_path):
     # exactly two successful completes recorded
     completes = [e for e in journal_events(repo) if e["event"] == "complete"]
     assert len(completes) == 2
+
+
+def test_waiter_ignores_peer_terminal_and_reports_own_exact_candidate(tmp_path):
+    repo = setup_repo(tmp_path, "watcher")
+    slow_body = RUN_RECORDER.replace("check)\n", "check)\n        sleep 0.6\n", 1)
+    write_run_script(repo, slow_body)
+    with with_main_unlocked(repo):
+        run_git(repo, "add", "run")
+        run_git(repo, "commit", "-q", "-m", "observable queued release")
+    run_git(repo, "update-ref", "refs/greenline/last-green", "main")
+    first = make_worktree(repo, "watch-first")
+    commit_in(first, "first.txt", "1\n", "first watched release")
+    second = make_worktree(repo, "watch-second")
+    commit_in(second, "second.txt", "2\n", "second watched release")
+
+    peer = subprocess.Popen(
+        [sys.executable, GREENLINE, "submit", "--repo", str(first)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    time.sleep(0.2)
+    watched = subprocess.run(
+        [
+            GREENLINE_WAIT,
+            "--repo",
+            str(second),
+            "gl/watch-second",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=25,
+    )
+    peer_out, _ = peer.communicate(timeout=25)
+    assert peer.returncode == 0, peer_out
+    assert watched.returncode == 0, watched.stdout + watched.stderr
+
+    completes = [event for event in journal_events(repo) if event["event"] == "complete"]
+    own = next(event for event in completes if event["branch"] == "gl/watch-second")
+    peer_event = next(event for event in completes if event["branch"] == "gl/watch-first")
+    assert f"candidate={own['merged']}" in watched.stdout
+    assert peer_event["merged"] not in watched.stdout
 
 
 def test_crash_recovery_ffed_but_not_deployed(tmp_path):
@@ -981,6 +1036,45 @@ def test_main_hard_lock_blocks_commit_and_no_verify(tmp_path):
     run_git(repo, "clean", "-fd")
 
 
+def test_main_hard_lock_allows_pack_refs_noop_but_rejects_real_update(tmp_path):
+    repo = setup_repo(tmp_path)
+    main_before = sha(repo, "main")
+    worktree = make_worktree(repo, "pack-refs-feature")
+    commit_in(worktree, "feature.txt", "feature\n", "feature commit")
+    feature_sha = sha(worktree, "HEAD")
+
+    packed = subprocess.run(
+        ["git", "-C", str(repo), "pack-refs", "--all", "--no-prune"],
+        capture_output=True,
+        text=True,
+    )
+    assert packed.returncode == 0, packed.stdout + packed.stderr
+    assert sha(repo, "main") == main_before
+
+    # Leave main represented only by packed-refs so update-ref -d attempts a
+    # real logical deletion rather than removing a redundant loose copy.
+    (common_dir(repo) / "refs" / "heads" / "main").unlink()
+    assert sha(repo, "main") == main_before
+
+    deleted = subprocess.run(
+        ["git", "-C", str(repo), "update-ref", "-d", "refs/heads/main"],
+        capture_output=True,
+        text=True,
+    )
+    assert deleted.returncode != 0
+    assert "greenline" in (deleted.stdout + deleted.stderr).lower()
+    assert sha(repo, "main") == main_before
+
+    changed = subprocess.run(
+        ["git", "-C", str(repo), "update-ref", "refs/heads/main", feature_sha],
+        capture_output=True,
+        text=True,
+    )
+    assert changed.returncode != 0
+    assert "greenline" in (changed.stdout + changed.stderr).lower()
+    assert sha(repo, "main") == main_before
+
+
 def test_worktree_commits_unaffected_by_main_lock(tmp_path):
     """Feature-branch commits in worktrees must keep working under the hard lock."""
     repo = setup_repo(tmp_path)
@@ -993,13 +1087,10 @@ def test_worktree_commits_unaffected_by_main_lock(tmp_path):
 
 
 # --------------------------------------------------------------------------
-# deploy coalescing
+# deploy attestation under queued submissions
 # --------------------------------------------------------------------------
-# Every deploy restarts prod. In agentd3 that meant 15 restarts in one day and
-# ~20% of all agent turns being interrupted mid-work. Coalescing collapses a
-# burst of queued submissions into ONE deploy at the end of the burst: each
-# candidate is still gated and merged individually, so nothing skips the check —
-# only the restart is shared.
+# A configured legacy coalesce_deploys key must not weaken the release contract:
+# each successful submission checks, deploys, publishes, and records completion.
 
 
 def deploy_shas(repo: Path):
@@ -1028,13 +1119,13 @@ def submit_burst(repo: Path, worktrees, env=None):
         )
         # Let the first process take the lock before the rest start queueing,
         # so the queue is real rather than a race we hope lands the right way.
-        time.sleep(1.2 if i == 0 else 0.3)
+        time.sleep(0.2 if i == 0 else 0.1)
     return [(p, p.communicate(timeout=180)[0]) for p in procs]
 
 
 def slow_check_repo(tmp_path, coalesce: bool) -> Path:
     repo = setup_repo(tmp_path, coalesce=coalesce)
-    slow_body = RUN_RECORDER.replace("check)\n", "check)\n        sleep 3\n", 1)
+    slow_body = RUN_RECORDER.replace("check)\n", "check)\n        sleep 0.6\n", 1)
     write_run_script(repo, slow_body)
     with with_main_unlocked(repo):
         run_git(repo, "add", "-A")
@@ -1043,10 +1134,10 @@ def slow_check_repo(tmp_path, coalesce: bool) -> Path:
     return repo
 
 
-def test_queued_submissions_coalesce_into_one_deploy(tmp_path):
+def test_legacy_coalesce_config_never_defers_a_successful_release(tmp_path):
     repo = slow_check_repo(tmp_path, coalesce=True)
     worktrees = []
-    for name in ("c1", "c2", "c3"):
+    for name in ("c1", "c2"):
         wt = make_worktree(repo, name)
         commit_in(wt, f"{name}.txt", "x\n", name)
         worktrees.append(wt)
@@ -1055,77 +1146,15 @@ def test_queued_submissions_coalesce_into_one_deploy(tmp_path):
     for proc, out in results:
         assert proc.returncode == 0, out
 
-    # Every candidate was gated and landed on main — coalescing must never skip
-    # a check or drop a commit.
-    for name in ("c1", "c2", "c3"):
+    for name in ("c1", "c2"):
         assert (repo / f"{name}.txt").exists(), f"{name} did not reach main"
     checks = [ln for ln in record_lines(repo) if ln.startswith("check ")]
-    assert len(checks) == 3, f"every candidate must be checked, got {len(checks)}"
-
-    # ...but prod was restarted once, not three times.
+    assert len(checks) == 2, f"every candidate must be checked, got {len(checks)}"
     deploys = deploy_shas(repo)
-    assert len(deploys) == 1, f"burst must collapse to ONE deploy, got {len(deploys)}"
-    assert deploys[0] == sha(repo, "main"), (
-        "the single deploy must ship the final main tip"
-    )
-
-    deferred = [e for e in journal_events(repo) if e["event"] == "deploy_deferred"]
-    assert len(deferred) == 2, f"two deploys should have been deferred, got {deferred}"
-    assert pending_deploy(repo) is None, "pending record must be cleared once deployed"
-
-
-def test_coalescing_is_opt_in(tmp_path):
-    """Without the config flag, every submission deploys — the old contract."""
-    repo = slow_check_repo(tmp_path, coalesce=False)
-    worktrees = []
-    for name in ("d1", "d2"):
-        wt = make_worktree(repo, name)
-        commit_in(wt, f"{name}.txt", "x\n", name)
-        worktrees.append(wt)
-
-    for proc, out in submit_burst(repo, worktrees):
-        assert proc.returncode == 0, out
-
-    assert len(deploy_shas(repo)) == 2, "coalescing must stay off unless enabled"
+    assert len(deploys) == 2, "every successful release must attest its own deploy"
+    assert deploys[-1] == sha(repo, "main")
     assert not [e for e in journal_events(repo) if e["event"] == "deploy_deferred"]
-
-
-def test_failed_last_submission_still_deploys_last_good_commit(tmp_path):
-    """The burst's last member fails its check; the deferred deploy must still
-    ship. Otherwise prod sits behind a green main with nobody left to deploy it —
-    the one way coalescing could silently lose a release."""
-    # The check fails on CONTENT, not on a timing window: any candidate that
-    # introduces b1.txt is rejected. That makes "the last submission of the
-    # burst fails" deterministic instead of a race we hope lands right.
-    repo = setup_repo(tmp_path, coalesce=True)
-    body = RUN_RECORDER.replace(
-        "check)\n",
-        "check)\n        sleep 3\n        [ -f b1.txt ] && { echo bad candidate >&2; exit 7; }\n",
-        1,
-    )
-    write_run_script(repo, body)
-    with with_main_unlocked(repo):
-        run_git(repo, "add", "-A")
-        run_git(repo, "commit", "-q", "-m", "content-gated check")
-    run_git(repo, "update-ref", "refs/greenline/last-green", "main")
-
-    good = make_worktree(repo, "g1")
-    commit_in(good, "g1.txt", "x\n", "g1")
-    bad = make_worktree(repo, "b1")
-    commit_in(bad, "b1.txt", "x\n", "b1")
-
-    results = submit_burst(repo, [good, bad])
-    assert results[0][0].returncode == 0, results[0][1]
-    assert results[1][0].returncode == 1, results[1][1]
-
-    assert (repo / "g1.txt").exists(), "the good candidate must be on main"
-    assert not (repo / "b1.txt").exists(), "the failed candidate must not be on main"
-
-    deploys = deploy_shas(repo)
-    assert deploys, "the deferred deploy must still ship after the burst fails"
-    assert deploys[-1] == sha(repo, "main"), "prod must end at the last good main"
     assert pending_deploy(repo) is None, "nothing may be left pending"
-    assert [e for e in journal_events(repo) if e["event"] == "pending_deployed"]
 
 
 def test_deploy_pending_command_ships_a_stranded_deploy(tmp_path):
@@ -1143,8 +1172,8 @@ def test_deploy_pending_command_ships_a_stranded_deploy(tmp_path):
     )
 
     proc = gl(repo, "status", expect=0)
-    assert "DEPLOY DEFERRED" in proc.stdout, proc.stdout
-    # doctor must call it out: nothing is queued to finish the job.
+    assert "DEPLOY UNATTESTED" in proc.stdout, proc.stdout
+    # doctor must call out the missing deploy attestation.
     assert gl(repo, "doctor").returncode != 0
 
     gl(repo, "deploy-pending", expect=0)
@@ -1202,10 +1231,108 @@ def test_deploy_pending_publishes_what_it_deploys(tmp_path):
 # is no user-facing override, so tests patch module constants in process.
 
 
-def test_check_timing_defaults_are_five_soft_ten_hard_minutes():
+def test_release_timing_defaults_are_three_minute_target_ten_minute_hard_limit():
     mod = load_greenline_module()
-    assert mod.CHECK_SOFT_BUDGET_SECONDS == 300
-    assert mod.CHECK_HARD_TIMEOUT_SECONDS == 600
+    assert mod.RELEASE_TARGET_SECONDS == 180
+    assert mod.RELEASE_HARD_TIMEOUT_SECONDS == 600
+    assert mod.RECOVERY_HARD_TIMEOUT_SECONDS == 600
+
+
+def test_cumulative_release_budget_bounds_check_then_deploy_and_reaps_group(
+    tmp_path,
+):
+    repo = setup_repo(tmp_path, "cumulative")
+    body = SLOW_DEPLOY.replace(
+        'if [ "$1" = "deploy" ]; then',
+        'if [ "$1" = "check" ]; then\n'
+        '  printf "started\\n" > "$FLAGDIR/check-started.fifo"\n'
+        '  IFS= read -r _ < "$FLAGDIR/check-release.fifo"\n'
+        "fi\n"
+        'if [ "$1" = "deploy" ]; then',
+    )
+    write_run_script(repo, body)
+
+    mod = load_greenline_module()
+    loaded = mod.load_repo(repo)
+    log_path = loaded.logs_dir / "cumulative-stage-budget.log"
+    started_fifo = common_dir(repo) / "check-started.fifo"
+    release_fifo = common_dir(repo) / "check-release.fifo"
+    os.mkfifo(started_fifo)
+    os.mkfifo(release_fifo)
+    mod.DEPLOY_HARD_TIMEOUT_SECONDS = 3.0
+    deadline_started = time.monotonic()
+    mod.ACTIVE_RELEASE_DEADLINE = mod.ReleaseDeadline(
+        deadline_started, 3.0, mod.RELEASE_TIMEOUT_REASON
+    )
+    try:
+        result = {}
+
+        def run_check_stage():
+            result["check"] = mod.run_gate_check(loaded, repo, log_path)
+
+        check_thread = threading.Thread(target=run_check_stage)
+        check_thread.start()
+        with started_fifo.open() as stream:
+            assert stream.readline().strip() == "started"
+
+        remaining_at_rendezvous = mod.ACTIVE_RELEASE_DEADLINE.remaining()
+        threading.Event().wait(max(0.0, remaining_at_rendezvous - 1.0))
+        with release_fifo.open("w") as stream:
+            stream.write("continue\n")
+        check_thread.join(timeout=2)
+
+        assert not check_thread.is_alive()
+        assert remaining_at_rendezvous > 1.5
+        check_outcome, _ = result["check"]
+        assert check_outcome.returncode == 0
+        assert not check_outcome.timed_out
+
+        deploy_started = time.monotonic()
+        deploy_outcome = mod.run_gate_deploy(loaded, log_path)
+        deploy_elapsed = time.monotonic() - deploy_started
+    finally:
+        mod.ACTIVE_RELEASE_DEADLINE = None
+
+    assert deploy_outcome.timed_out
+    assert deploy_outcome.timeout_reason == mod.RELEASE_TIMEOUT_REASON
+    assert deploy_elapsed < mod.DEPLOY_HARD_TIMEOUT_SECONDS
+    child = int((common_dir(repo) / "slow-child.pid").read_text().strip())
+    assert pid_is_gone(child), f"child {child} survived release deadline cleanup"
+
+
+def test_lock_admission_consumes_release_budget_and_fails_before_check(
+    tmp_path, capsys
+):
+    repo = setup_repo(tmp_path, "lockbudget")
+    wt = make_worktree(repo, "waiting")
+    commit_in(wt, "waiting.txt", "x\n", "wait behind lock")
+    lock_path = common_dir(repo) / "greenline" / "lock"
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import fcntl,sys,time; f=open(sys.argv[1],'w'); "
+            "fcntl.flock(f,fcntl.LOCK_EX); print('held',flush=True); time.sleep(5)",
+            str(lock_path),
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert holder.stdout.readline().strip() == "held"
+    try:
+        mod = load_greenline_module()
+        mod.RELEASE_HARD_TIMEOUT_SECONDS = 0.7
+        started = time.monotonic()
+        assert mod.main(["submit", "--repo", str(wt)]) == 1
+        elapsed = time.monotonic() - started
+    finally:
+        holder.terminate()
+        holder.wait(timeout=5)
+
+    captured = capsys.readouterr()
+    assert 0.5 <= elapsed < 1.5
+    assert "gate lock admission" in captured.err
+    assert not record_lines(repo), "deadline-expired waiter must not start check or deploy"
 
 
 def test_check_within_soft_budget_says_nothing(tmp_path, capsys, monkeypatch):
@@ -1217,8 +1344,7 @@ def test_check_within_soft_budget_says_nothing(tmp_path, capsys, monkeypatch):
     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
 
     mod = load_greenline_module()
-    mod.CHECK_SOFT_BUDGET_SECONDS = 60
-    mod.CHECK_HARD_TIMEOUT_SECONDS = 61
+    mod.RELEASE_TARGET_SECONDS = 60
     assert mod.main(["submit", "--repo", str(wt)]) == 0
     out = capsys.readouterr().out
 
@@ -1227,49 +1353,52 @@ def test_check_within_soft_budget_says_nothing(tmp_path, capsys, monkeypatch):
     assert not [e for e in journal_events(repo) if e["event"] == "gate_slow"]
 
 
-def test_slow_gate_directive_orders_the_agent_to_optimize_now():
-    """An over-budget gate must read as THIS agent's next task. Scheduling it,
-    deferring it, or handing it to someone else is exactly what this replaced."""
+def test_slow_release_directive_describes_detached_optimization():
     mod = load_greenline_module()
     directive = mod.slow_gate_directive(412.0)
 
-    assert directive.startswith("MANDATORY NEXT TASK")
-    assert "412.0s" in directive and "300s" in directive
-    for escape in ("Do NOT schedule", "defer", "another agent"):
-        assert escape in directive
-    for cheat in ("weaken", "skip", "extend deadlines", "change the budget"):
-        assert cheat in directive
+    assert directive.startswith("NOTE: this release was green")
+    assert "412.0s" in directive and "180s target" in directive
+    assert "detached speed-up investigation" in directive
+    assert "preserve validation" in directive
 
 
-def test_slow_submit_orders_its_own_agent_after_completion_and_unlock(
+def test_slow_submit_launches_detached_speedup_after_completion_and_unlock(
     tmp_path, capsys, monkeypatch
 ):
     repo = setup_repo(tmp_path, "slowsuccess")
     wt = make_worktree(repo, "slow")
     commit_in(wt, "slow.txt", "slow\n", "slow successful check")
-    record = tmp_path / "agentd3.json"
-    bindir = install_agentd3_tripwire(tmp_path, record)
-    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+    record = tmp_path / "speedup-args.json"
+    launcher = tmp_path / "speedup-launcher"
+    launcher.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json,sys\n"
+        f"open({str(record)!r}, 'w').write(json.dumps(sys.argv[1:]))\n"
+    )
+    launcher.chmod(0o755)
 
     mod = load_greenline_module()
-    mod.CHECK_SOFT_BUDGET_SECONDS = 0
-    mod.CHECK_HARD_TIMEOUT_SECONDS = 10
+    mod.RELEASE_TARGET_SECONDS = 0
+    mod.SPEEDUP_CLI = launcher
     assert mod.main(["submit", "--repo", str(wt)]) == 0
     out = capsys.readouterr().out
 
-    assert not record.exists(), "a slow gate must not create work outside this agent"
+    assert record.exists(), "the detached speed-up launcher must be invoked"
     slow = [e for e in journal_events(repo) if e["event"] == "gate_slow"]
     assert len(slow) == 1
     assert slow[0]["candidate"] == sha(repo, "main")
-    assert slow[0]["budget_seconds"] == 0 and slow[0]["seconds"] > 0
-    assert "SOFT CHECK BUDGET EXCEEDED" in out and "MANDATORY NEXT TASK" in out
-    # green first, told second: the gate completed before the agent is directed
-    assert journal_events(repo)[-2]["event"] == "complete"
+    assert slow[0]["target_seconds"] == 0 and slow[0]["seconds"] > 0
+    assert "RELEASE TARGET EXCEEDED" in out
+    events = journal_events(repo)
+    assert next(i for i, e in enumerate(events) if e["event"] == "complete") < next(
+        i for i, e in enumerate(events) if e["event"] == "speedup_triggered"
+    )
     status = gl(repo, "status", expect=0)
     assert "gate_slow" in status.stdout
     latest_log = sorted((common_dir(repo) / "greenline" / "logs").glob("*.log"))[-1]
     logged = latest_log.read_text()
-    assert "SOFT CHECK BUDGET EXCEEDED" in logged and "MANDATORY NEXT TASK" in logged
+    assert "RELEASE TARGET EXCEEDED" in logged and "detached speed-up" in logged
 
 
 def test_slow_report_failure_keeps_submit_green(tmp_path, capsys, monkeypatch):
@@ -1280,8 +1409,7 @@ def test_slow_report_failure_keeps_submit_green(tmp_path, capsys, monkeypatch):
     commit_in(wt, "slow.txt", "slow\n", "slow successful check")
 
     mod = load_greenline_module()
-    mod.CHECK_SOFT_BUDGET_SECONDS = 0
-    mod.CHECK_HARD_TIMEOUT_SECONDS = 10
+    mod.RELEASE_TARGET_SECONDS = 0
 
     def explode(*_args, **_kwargs):
         raise RuntimeError("journal is unwritable")
@@ -1309,13 +1437,13 @@ def test_check_timeout_fails_the_gate_and_reaps_children(
     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
 
     mod = load_greenline_module()
-    mod.CHECK_SOFT_BUDGET_SECONDS = 0
-    mod.CHECK_HARD_TIMEOUT_SECONDS = 2
+    mod.RELEASE_TARGET_SECONDS = 0
+    mod.RELEASE_HARD_TIMEOUT_SECONDS = 5
     rc = mod.main(["submit", "--repo", str(wt)])
     out = capsys.readouterr().out
     assert rc == 1
     assert "CHECK TIMED OUT" in out
-    assert "10-minute hard" in out and "DOCTRINE.md" in out
+    assert "600-second deadline" in out and "DOCTRINE.md" in out
 
     # the check's grandchild (a bare `sleep`) must have been reaped with the group
     child = int((common_dir(repo) / "slow-child.pid").read_text().strip())
@@ -1330,9 +1458,30 @@ def test_check_timeout_fails_the_gate_and_reaps_children(
 
     last = journal_events(repo)[-1]
     assert last["event"] == "fail" and last["stage"] == "check"
-    assert last["reason"] == mod.CHECK_TIMEOUT_REASON
+    assert last["reason"] == mod.RELEASE_TIMEOUT_REASON
     assert not [e for e in journal_events(repo) if e["event"] == "gate_slow"]
     assert not notification.exists()
+
+
+def test_near_limit_success_is_published_before_deadline(tmp_path, capsys):
+    repo = setup_repo(tmp_path, "nearlimit")
+    wt = make_worktree(repo, "near")
+    body = RUN_RECORDER.replace("check)\n", "check)\n        sleep 0.8\n", 1)
+    body = body.replace("deploy)\n", "deploy)\n        sleep 0.8\n", 1)
+    write_run_script(wt, body)
+    run_git(wt, "add", "run")
+    run_git(wt, "commit", "-q", "-m", "near-limit successful release")
+
+    mod = load_greenline_module()
+    mod.RELEASE_TARGET_SECONDS = 60
+    mod.RELEASE_HARD_TIMEOUT_SECONDS = 4.5
+    assert mod.main(["submit", "--repo", str(wt)]) == 0
+    capsys.readouterr()
+
+    complete = [e for e in journal_events(repo) if e["event"] == "complete"][-1]
+    assert complete["merged"] == sha(repo, "main")
+    assert complete["total_seconds"] < 4.5
+    assert (common_dir(repo) / "greenline" / "deployed").read_text().strip() == complete["merged"]
 
 
 def test_adopt_check_timeout_is_a_failure_too(tmp_path, capsys):
@@ -1345,8 +1494,8 @@ def test_adopt_check_timeout_is_a_failure_too(tmp_path, capsys):
     tip = sha(repo, "main")
 
     mod = load_greenline_module()
-    mod.CHECK_SOFT_BUDGET_SECONDS = 0
-    mod.CHECK_HARD_TIMEOUT_SECONDS = 2
+    mod.RELEASE_TARGET_SECONDS = 0
+    mod.RELEASE_HARD_TIMEOUT_SECONDS = 5
     rc = mod.main(["adopt", "--repo", str(repo)])
     out = capsys.readouterr().out
     assert rc == 1
@@ -1358,7 +1507,7 @@ def test_adopt_check_timeout_is_a_failure_too(tmp_path, capsys):
     assert not (common_dir(repo) / "greenline" / "deployed").exists()
     last = journal_events(repo)[-1]
     assert last["event"] == "adopt_failed" and last["stage"] == "check"
-    assert last["reason"] == mod.CHECK_TIMEOUT_REASON
+    assert last["reason"] == mod.RELEASE_TIMEOUT_REASON
 
 
 def test_slow_adopt_orders_the_adopting_agent(tmp_path, capsys, monkeypatch):
@@ -1373,13 +1522,16 @@ def test_slow_adopt_orders_the_adopting_agent(tmp_path, capsys, monkeypatch):
     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
 
     mod = load_greenline_module()
-    mod.CHECK_SOFT_BUDGET_SECONDS = 0
-    mod.CHECK_HARD_TIMEOUT_SECONDS = 10
+    mod.RELEASE_TARGET_SECONDS = 0
+    launcher = tmp_path / "speedup-launcher"
+    launcher.write_text("#!/usr/bin/env sh\nexit 0\n")
+    launcher.chmod(0o755)
+    mod.SPEEDUP_CLI = launcher
     assert mod.main(["adopt", "--repo", str(repo)]) == 0
     out = capsys.readouterr().out
 
     assert not record.exists()
-    assert "MANDATORY NEXT TASK" in out
+    assert "RELEASE TARGET EXCEEDED" in out
     slow = [e for e in journal_events(repo) if e["event"] == "gate_slow"]
     assert len(slow) == 1 and slow[0]["branch"] == "adopt"
     assert slow[0]["candidate"] == tip
@@ -1405,17 +1557,51 @@ def test_deploy_timeout_rolls_back_like_a_failed_deploy_and_reaps_children(
     repo = setup_repo(tmp_path, "slowdeploy")
     main_before = sha(repo, "main")
     wt = make_worktree(repo, "slow")
-    write_run_script(wt, SLOW_DEPLOY)
+    body = SLOW_DEPLOY.replace(
+        'if [ "$1" = "deploy" ]; then',
+        'if [ "$1" = "check" ]; then\n'
+        '  printf "started\\n" > "$FLAGDIR/check-started.fifo"\n'
+        '  IFS= read -r _ < "$FLAGDIR/check-release.fifo"\n'
+        "fi\n"
+        'if [ "$1" = "deploy" ]; then',
+    )
+    write_run_script(wt, body)
     run_git(wt, "add", "-A")
     run_git(wt, "commit", "-q", "-m", "slow deploy")
 
     mod = load_greenline_module()
-    mod.DEPLOY_HARD_TIMEOUT_SECONDS = 2
+    mod.RELEASE_HARD_TIMEOUT_SECONDS = 30
+    mod.PROCESS_GROUP_TERM_GRACE_SECONDS = 0.2
+    mod.PROCESS_GROUP_KILL_GRACE_SECONDS = 0.5
+    mod.PROCESS_PIPE_DRAIN_SECONDS = 0.5
+    started_fifo = common_dir(repo) / "check-started.fifo"
+    release_fifo = common_dir(repo) / "check-release.fifo"
+    os.mkfifo(started_fifo)
+    os.mkfifo(release_fifo)
+    rendezvous_errors = []
+
+    def constrain_release_after_check_starts():
+        with started_fifo.open() as stream:
+            if stream.readline().strip() != "started":
+                rendezvous_errors.append("check rendezvous did not start")
+        deadline = mod.ACTIVE_RELEASE_DEADLINE
+        if deadline is None:
+            rendezvous_errors.append("release deadline was not active during check")
+        else:
+            deadline.hard_seconds = time.monotonic() - deadline.started + 2.0
+        with release_fifo.open("w") as stream:
+            stream.write("continue\n")
+
+    controller = threading.Thread(target=constrain_release_after_check_starts)
+    controller.start()
     rc = mod.main(["submit", "--repo", str(wt)])
+    controller.join(timeout=1)
     out = capsys.readouterr().out
+    assert not controller.is_alive()
+    assert not rendezvous_errors
     assert rc == 1
     assert "DEPLOY TIMED OUT" in out
-    assert mod.DEPLOY_TIMEOUT_REASON in out
+    assert mod.RELEASE_TIMEOUT_REASON in out
 
     # the deploy's grandchild (a bare `sleep`) must have gone with the group
     child = int((common_dir(repo) / "slow-child.pid").read_text().strip())
@@ -1430,7 +1616,7 @@ def test_deploy_timeout_rolls_back_like_a_failed_deploy_and_reaps_children(
 
     last = journal_events(repo)[-1]
     assert last["event"] == "deploy_failed" and last["pre_main"] == main_before
-    assert last["reason"] == mod.DEPLOY_TIMEOUT_REASON
+    assert last["reason"] == mod.RELEASE_TIMEOUT_REASON
 
 
 def test_health_probe_timeout_reports_unhealthy(tmp_path):

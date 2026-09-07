@@ -7,7 +7,7 @@ before writing code or tests.
 - `{main_branch}` == what prod runs == green, always.
 - The canonical checkout is pristine — never edit it by hand.
 - All work happens in worktrees branched from last-green.
-- Every merge goes through the serialized gate: full `check` + real `deploy`.
+- Every merge goes through the serialized gate: change-impact `check` + real `deploy`.
 
 **Your workflow:**
 1. `greenline worktree <name>` — get a worktree at `{worktree_base}/<name>` on branch `gl/<name>`.

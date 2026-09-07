@@ -3,9 +3,12 @@
 contract_version = {contract_version}
 main_branch = "{main_branch}"
 
-# Verdict command. cwd = the worktree being gated. Must build + lint + run the
-# FULL test suite against a TEST datastore, and exit nonzero on any failure.
-# Must be safe to run concurrently from multiple worktrees.
+# Verdict command. cwd = the worktree being gated. Start with all useful,
+# relevant verification that fits in 3 minutes; use changed paths and transitive
+# impact to prove coverage of affected behavior against a TEST datastore.
+# Preserve relevant coverage; run broader/external suites only when intentionally
+# relevant. Product growth must not increase standard release time. Exit nonzero
+# on any relevant failure; support concurrent worktrees.
 check = "./run check"
 
 # Deploy command. cwd = the canonical checkout. Must rebuild/restart prod,
@@ -20,3 +23,6 @@ service = "{service}"
 
 # Persistent worktree base for this repo (gate lives at <base>/gate).
 worktree_base = "{worktree_base}"
+
+# Legacy compatibility only. Greenline always deploys every successful release.
+# coalesce_deploys = false

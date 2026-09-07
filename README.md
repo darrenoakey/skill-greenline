@@ -2,7 +2,7 @@
 
 # greenline
 
-A local, serialized gated CI/CD system for solo-dev Mac environments where multiple AI agents work simultaneously in git worktrees. Every merge to `main` goes through one exclusive gate that runs your full check suite and performs a real production deploy — so `main` is always green, always deployed, and always clean.
+A local, serialized gated CI/CD system for solo-dev Mac environments where multiple AI agents work simultaneously in git worktrees. Every merge to `main` goes through one exclusive gate that runs change-impact validation and performs a real production deploy — so `main` is always green, always deployed, and always clean.
 
 ## Purpose
 
@@ -13,6 +13,13 @@ It does this by:
 - Keeping the canonical repo checkout on `main`, pristine, untouched by any agent or human
 - Routing all work through isolated git worktrees branched from the last known-good commit
 - Serializing every merge through one gate that squash-merges, checks, deploys, and publishes — or rolls back cleanly if anything fails
+
+Work in the smallest coherent, useful chunks: validate the relevant impact and
+release each chunk immediately before starting the next. Prioritize a working,
+deployed fix for reported production blockers; do not broaden ready-to-ship scope
+or bundle speculative improvements. Each release is a boundary, not a permission
+pause—continue the whole authorized goal. Impact selection must become smarter as
+the product grows so growth does not increase release latency.
 
 ## Installation
 
@@ -32,12 +39,12 @@ This writes `greenline.toml`, creates the gate worktree, installs git hooks that
 |---|---|
 | `greenline setup` | Set up a repo for greenline. Installs hooks, config, and state. |
 | `greenline worktree NAME` | Create a new worktree and branch `gl/NAME` off the last green commit. |
-| `greenline submit [BRANCH]` | Run a branch through the gate: check + deploy. Blocks until the lock is free. |
+| `greenline submit [BRANCH]` | Run a branch through queue + check + deploy + publish; target 180 seconds, hard end-to-end ceiling 600 seconds. |
 | `greenline adopt` | Gate the current `main` tip in place — for commits that arrived outside the gate. |
 | `greenline done` | Remove a merged worktree and delete its branch. |
 | `greenline status` | Show lock state, SHA drift, last journal entries, and gate health. |
 | `greenline doctor [--fix]` | Check all invariants; `--fix` recovers from a crashed gate. |
-| `greenline deploy-pending` | Deploy a gated `main` whose deploy was deferred (only relevant with `coalesce_deploys = true`). |
+| `greenline deploy-pending` | Recover a legacy or interrupted gated `main` that lacks deploy attestation. |
 
 Add `-v` / `--verbose` to any command for full git and command output.
 
@@ -118,7 +125,7 @@ greenline worktree add-auth
 cd $(greenline worktree add-auth 2>/dev/null || echo .worktrees/add-auth)
 # ... make changes, commit ...
 
-# Submit through the gate (blocks if another submission is running)
+# Submit through the simple exclusive gate (waits within the release clock if busy)
 greenline submit
 
 # Clean up
@@ -141,29 +148,28 @@ greenline status
 greenline submit gl/my-feature --repo /Users/you/src/myproject
 ```
 
-**Running submit detached from any tool timeout:**
+**Submit and watch one exact branch/candidate:**
 
 ```bash
-nohup greenline submit > submit.log 2>&1 &
-tail -f submit.log
+scripts/greenline-wait.sh gl/my-feature --repo /Users/you/src/myproject
 ```
 
 ## The contract your repo must fulfil
 
 greenline calls two scripts in your repo:
 
-- **`./run check`** — run from the gate worktree. Must build, lint, and run the full test suite against a test datastore. Exit code is the verdict. Must be safe to run concurrently from multiple worktrees. Five minutes is a soft budget; successful checks may continue to the 10-minute hard timeout. A 5–10 minute success remains green and, after completion and lock release, greenline tells the submitting agent that making the check fit the budget is its mandatory next task — it is never scheduled or delegated. Beyond 10 minutes the whole check process group is killed and the gate fails.
-- **`./run deploy`** — run from the canonical checkout. Must rebuild and restart production, health-check, and exit nonzero if unhealthy. Must be idempotent. It has a 180-second hard timeout; a deploy killed at the cap fails and rolls back exactly like a nonzero exit.
+- **`./run check`** — run from the gate worktree. Start with all useful, relevant verification that fits in three minutes, then use changed paths and transitive impact to prove the selection covers every behavior the candidate could affect against a test datastore. Preserve relevant coverage; run broader or external suites only when intentionally relevant. Exit code is the verdict. It must be safe to run concurrently from multiple worktrees, and product growth must not increase standard release time.
+- **`./run deploy`** — run from the canonical checkout. Must rebuild and restart production, health-check, and exit nonzero if unhealthy. Must be idempotent. During a release it uses the actual aggregate time remaining, with no narrower deploy cap.
 - **`./run health`** *(optional)* — a probe with no side effects, under a 5-second hard timeout; a probe that does not answer in time is unhealthy. If absent, greenline re-runs `deploy` as the health probe (under the deploy cap).
 
-All three timeouts — check 600s, deploy 180s, health 5s — are hard, have no config override, and kill the whole process group on expiry.
+The complete release normally averages and targets 180 seconds, with one 600-second loaded-machine worst-case hard deadline from invocation through queue, reconcile, check, deploy, publish, and attestation. At five minutes, immediately investigate the active stage and process tree. At ten minutes, terminate and reap the attempt, then fix its cause before submitting again—never wait for load, rearm a TTL watcher, or retry unchanged. Avoid narrower inner timeouts that can falsely fail useful work while aggregate time remains. Expiry is a terminal release failure; rollback/recovery then runs under a separate bounded clock and is reported as recovery, never success. Successful releases durably journal and print queue/check/deploy/publish/total timings, and total time over 180 seconds automatically triggers a detached speed-up investigation after unlock; acceptance is reported only after the investigation tool proves it.
 
 ## Key rules for agents working in greenline repos
 
 - **Never edit the canonical checkout.** All edits go in a worktree.
 - **Never push directly to `main`.** The pre-push hook blocks it; the reference-transaction hook makes it impossible even without `--no-verify`.
 - **Always use `greenline worktree`** to start work, not raw `git worktree add`.
-- **Submit detached from any session timeout** — use `nohup` or a background process so a harness timeout cannot SIGTERM the gate mid-check.
+- **Use `scripts/greenline-wait.sh`** — it watches only the exact branch and source candidate it submitted, observes process exit, and never treats a peer's terminal event as its own.
 - **When `--repo` is passed to `greenline submit`, always pass the branch explicitly** — without it, submit resolves to `main` and fails immediately.
 
 ## License

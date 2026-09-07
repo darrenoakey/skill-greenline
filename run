@@ -2,9 +2,9 @@
 # greenline ./run — house dispatch facade. Gate contract is check/deploy/health.
 # lint and test are the local pieces check composes. Deploy does not restart
 # any gate or daemon: this repo is a CLI skill, not a supervised service.
-# ./run check is a 10+ min real-git pytest suite. Launch it in its own
-# process group (hub detached / setsid) and sleep; never wait on it in-turn.
-# Stopping agentd3 for the T1.0 proof must not share this session's pgid.
+# The complete release targets 180s and is hard-bounded at 600s. This repository's
+# check is change-impact validation: every test these files can break, not an
+# exhaustive product suite that grows without bound.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"

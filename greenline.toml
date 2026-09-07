@@ -3,9 +3,10 @@
 contract_version = 1
 main_branch = "main"
 
-# Verdict command. cwd = the worktree being gated. Must build + lint + run the
-# FULL test suite against a TEST datastore, and exit nonzero on any failure.
-# Must be safe to run concurrently from multiple worktrees.
+# Verdict command. cwd = the worktree being gated. Must build + lint and run
+# every validation selected by the candidate's changed paths and transitive
+# behavioral impact against a TEST datastore. The selection must cover all
+# affected behavior, exit nonzero on failure, and run safely across worktrees.
 check = "./run check"
 
 # Deploy command. cwd = the canonical checkout. Must rebuild/restart prod,
