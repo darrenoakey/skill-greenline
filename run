@@ -21,11 +21,19 @@ lint() {
 
 pytest_run() {
     # Doctrine: tests are isolated (per-test tmp repos, OS-assigned ports), so run
-    # them wide. xdist spreads individual tests across all cores (--dist load —
-    # test_greenline.py holds most of the suite, so per-file grouping would
-    # re-serialize it). Fall back to serial only if xdist is not installed.
+    # them wide. --dist load spreads individual tests, not files: test_greenline.py
+    # holds most of the suite, so per-file grouping would re-serialize it.
+    #
+    # Deliberately MORE workers than cores. This suite waits on git and greenline
+    # subprocesses far more than it computes — a full run burns ~128s of CPU over
+    # a ~180s wall, well under one core — so core-count parallelism leaves the
+    # machine idle waiting. Measured on a 10-core box: -n 10 = 181.7s,
+    # -n 24 = 147.6s, -n 48 = 209.9s. Scale with cores, and cap it so a very
+    # large machine does not spawn a swarm for a suite this size.
     if "${PY[@]}" -c "import xdist" 2>/dev/null; then
-        "${PY[@]}" -m pytest -x -q -n auto --dist load "$@"
+        local workers
+        workers="$("${PY[@]}" -c 'import os; print(min(32, 2 * (os.cpu_count() or 4) + 4))')"
+        "${PY[@]}" -m pytest -x -q -n "$workers" --dist load "$@"
     else
         "${PY[@]}" -m pytest -x -q "$@"
     fi
