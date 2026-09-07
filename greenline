@@ -205,10 +205,23 @@ def is_git_repo(path: str | Path) -> bool:
     ).returncode == 0
 
 
+_COMMON_DIR_CACHE: dict[str, Path] = {}
+
+
 def git_common_dir(path: str | Path) -> Path:
-    """Shared .git dir (resolves worktree gitdir to the real common dir)."""
+    """Shared .git dir (resolves worktree gitdir to the real common dir).
+
+    Memoized per checkout path: a repository's common dir cannot move while one
+    greenline command runs, and this is asked repeatedly on the release clock.
+    """
+    key = str(path)
+    cached = _COMMON_DIR_CACHE.get(key)
+    if cached is not None:
+        return cached
     out = git_out(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
-    return Path(out).resolve()
+    resolved = Path(out).resolve()
+    _COMMON_DIR_CACHE[key] = resolved
+    return resolved
 
 
 def canonical_path(path: str | Path) -> Path:
@@ -1020,7 +1033,14 @@ def log_tail(log_path: Path, n: int = 50) -> str:
 # gate worktree management
 # --------------------------------------------------------------------------
 def sync_submodules(path: str | Path) -> None:
-    """Synchronize recursive submodules to the checked-out gitlinks."""
+    """Synchronize recursive submodules to the checked-out gitlinks.
+
+    A tree with no .gitmodules has nothing to synchronize, and both git calls
+    are then pure process-spawn cost on the release clock. Checking for the file
+    is the same question git would ask, one stat instead of two subprocesses.
+    """
+    if not (Path(path) / ".gitmodules").exists():
+        return
     git(path, "submodule", "sync", "--recursive")
     git(path, "submodule", "update", "--init", "--recursive", "--force")
 

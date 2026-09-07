@@ -8,10 +8,14 @@ are exercised for real.
 
 from __future__ import annotations
 
+import fcntl
+import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import textwrap
 import threading
 import time
@@ -280,13 +284,8 @@ def sha(repo: Path, ref: str) -> str:
     return run_git(repo, "rev-parse", ref)
 
 
-def seed_config(
-    repo: Path, tmp_path: Path, name: str, coalesce: bool = False, health: str = ""
-):
-    """Pre-write greenline.toml with a tmp worktree_base so setup NEVER touches
-    /Volumes. setup leaves an existing toml untouched."""
-    wtbase = tmp_path / "wt" / name
-    (repo / "greenline.toml").write_text(
+def seed_config_text(name: str, wtbase: Path, coalesce: bool, health: str) -> str:
+    return (
         "contract_version = 1\n"
         'main_branch = "main"\n'
         'check = "./run check"\n'
@@ -295,6 +294,16 @@ def seed_config(
         f'service = "{name}"\n'
         f'worktree_base = "{wtbase}"\n'
         + (f"coalesce_deploys = {'true' if coalesce else 'false'}\n")
+    )
+
+
+def seed_config(
+    repo: Path, tmp_path: Path, name: str, coalesce: bool = False, health: str = ""
+):
+    """Pre-write greenline.toml with a tmp worktree_base so setup NEVER touches
+    /Volumes. setup leaves an existing toml untouched."""
+    (repo / "greenline.toml").write_text(
+        seed_config_text(name, tmp_path / "wt" / name, coalesce, health)
     )
 
 
@@ -317,6 +326,40 @@ def with_main_unlocked(repo: Path):
 
 
 def setup_repo(tmp_path: Path, name="proj", with_origin=False, coalesce=False) -> Path:
+    """A repo that greenline has already set up, from a prebuilt template.
+
+    Running `greenline setup` for real costs ~40 git subprocesses; almost every
+    test needs the result rather than the act, and DOCTRINE.md says to start
+    from a known position instead of rebuilding the world per test. So setup
+    runs once per suite into a fingerprinted template, and each test gets a copy
+    rebound to its own paths. Tests that assert on setup itself still invoke it
+    directly.
+    """
+    repo = clone_repo_template(tmp_path, name, coalesce=coalesce)
+    if with_origin:
+        origin = tmp_path / (name + ".git")
+        subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+        run_git(repo, "remote", "add", "origin", str(origin))
+        # Seed the remote at the repo's root commit, before greenline's own
+        # scaffolding: a freshly set-up repo has an origin that is behind main
+        # and has never been deployed, which is precisely what adopt exists for.
+        root = run_git(repo, "rev-list", "--max-parents=0", "main")
+        allow = common_dir(repo) / "greenline" / "allow-push"
+        allow.parent.mkdir(parents=True, exist_ok=True)
+        allow.write_text("seed\n")
+        try:
+            run_git(repo, "push", "-q", "origin", f"{root}:refs/heads/main")
+        finally:
+            allow.unlink(missing_ok=True)
+    assert not run_git(repo, "status", "--porcelain")
+    assert sha(repo, "refs/greenline/last-green") == sha(repo, "main")
+    return repo
+
+
+def setup_repo_the_slow_way(
+    tmp_path: Path, name="proj", with_origin=False, coalesce=False
+) -> Path:
+    """Build a set-up repo by really running `greenline setup` (no template)."""
     repo = make_repo(tmp_path, name, RUN_RECORDER, with_origin=with_origin)
     seed_config(repo, tmp_path, name, coalesce=coalesce)
     # setup honours the pre-seeded toml -> gate worktree lands in tmp.
@@ -325,6 +368,106 @@ def setup_repo(tmp_path: Path, name="proj", with_origin=False, coalesce=False) -
     gl(repo, "setup", expect=0)
     assert not run_git(repo, "status", "--porcelain")
     assert sha(repo, "refs/greenline/last-green") == sha(repo, "main")
+    return repo
+
+
+# --------------------------------------------------------------------------
+# prebuilt set-up-repo template
+# --------------------------------------------------------------------------
+# `greenline setup` is deterministic given the greenline script, the templates
+# it renders, and the seed config. Build it once per fingerprint, share it
+# across xdist workers under a file lock, and rebind each copy to its own
+# absolute paths. Everything absolute lives in a handful of known files.
+TEMPLATE_REPO_NAME = "proj"
+_TEMPLATE_PATH: Path | None = None
+
+
+def _template_fingerprint() -> str:
+    root = Path(__file__).resolve().parent.parent
+    digest = hashlib.sha256()
+    for path in [root / "greenline", *sorted((root / "templates").glob("*"))]:
+        digest.update(path.name.encode())
+        digest.update(path.read_bytes())
+    digest.update(RUN_RECORDER.encode())
+    digest.update(seed_config_text("NAME", Path("/BASE"), False, "").encode())
+    return digest.hexdigest()[:16]
+
+
+def repo_template() -> Path:
+    """Path to the shared, already-set-up template tree (built on first use)."""
+    global _TEMPLATE_PATH
+    if _TEMPLATE_PATH is not None:
+        return _TEMPLATE_PATH
+    base = Path(tempfile.gettempdir()) / f"greenline-template-{_template_fingerprint()}"
+    ready = Path(str(base) + ".ready")
+    lock = Path(str(base) + ".lock")
+    with lock.open("w") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        if not ready.exists():
+            # Build in place: setup bakes absolute paths into hooks and worktree
+            # links, so a build-then-rename would leave the template pointing at
+            # the staging directory. The ready marker is written last, so a
+            # crashed build is simply rebuilt rather than half-used.
+            shutil.rmtree(base, ignore_errors=True)
+            base.mkdir(parents=True)
+            setup_repo_the_slow_way(base, TEMPLATE_REPO_NAME)
+            ready.write_text("ok\n")
+    _TEMPLATE_PATH = base
+    return base
+
+
+def _path_rebindings(old_root: Path, new_root: Path, name: str) -> list[tuple[str, str]]:
+    """Textual path substitutions, longest match first.
+
+    macOS reports tmp paths in both /var and /private/var forms, and git stores
+    whichever form it was handed, so both spellings of the old root are mapped
+    onto the canonical new one. Order matters twice over: the repo- and
+    gate-specific paths must win over the bare root, and the /private form must
+    be tried before the /var form it contains, or rewriting the shorter one
+    first yields /private/private/var. Sorting by length descending gives both.
+    """
+    news = str(new_root.resolve())
+    pairs: list[tuple[str, str]] = []
+    for old in {str(old_root), str(old_root.resolve())}:
+        pairs.append((f"{old}/wt/{TEMPLATE_REPO_NAME}", f"{news}/wt/{name}"))
+        pairs.append((f"{old}/{TEMPLATE_REPO_NAME}", f"{news}/{name}"))
+        pairs.append((old, news))
+    return sorted(pairs, key=lambda pair: len(pair[0]), reverse=True)
+
+
+def clone_repo_template(tmp_path: Path, name: str, coalesce: bool = False) -> Path:
+    template = repo_template()
+    shutil.copytree(template, tmp_path, dirs_exist_ok=True, symlinks=True)
+    repo = tmp_path / name
+    if name != TEMPLATE_REPO_NAME:
+        (tmp_path / TEMPLATE_REPO_NAME).rename(repo)
+        (tmp_path / "wt" / TEMPLATE_REPO_NAME).rename(tmp_path / "wt" / name)
+
+    pairs = _path_rebindings(template, tmp_path, name)
+    gitdir = repo / ".git"
+    rebindable = [
+        gitdir / "config",
+        *(gitdir / "hooks").glob("*"),
+        *gitdir.glob("worktrees/*/gitdir"),
+        tmp_path / "wt" / name / "gate" / ".git",
+    ]
+    for path in rebindable:
+        if not path.is_file():
+            continue
+        text = path.read_text()
+        for old, new in pairs:
+            text = text.replace(old, new)
+        path.write_text(text)
+
+    # greenline.toml is committed, so rebinding it is a real commit on main —
+    # exactly what a relocated repo would need in production.
+    (repo / "greenline.toml").write_text(
+        seed_config_text(name, tmp_path / "wt" / name, coalesce, "")
+    )
+    with with_main_unlocked(repo):
+        run_git(repo, "add", "greenline.toml")
+        run_git(repo, "commit", "-q", "-m", f"greenline: bind {name} to this tree")
+    run_git(repo, "update-ref", "refs/greenline/last-green", "main")
     return repo
 
 
