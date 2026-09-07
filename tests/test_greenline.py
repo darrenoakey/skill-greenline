@@ -1335,6 +1335,35 @@ def test_lock_admission_consumes_release_budget_and_fails_before_check(
     assert not record_lines(repo), "deadline-expired waiter must not start check or deploy"
 
 
+def test_gate_lock_phase_start_is_scoped_to_each_acquisition(tmp_path):
+    repo = setup_repo(tmp_path, "lockphasestart")
+    mod = load_greenline_module()
+    loaded = mod.load_repo(repo)
+    stale_started = "2000-01-01T00:00:00+00:00"
+    loaded.status_path.write_text(
+        json.dumps({"pid": 91259, "started_utc": stale_started})
+    )
+    lock = mod.GateLock(loaded)
+
+    first_acquisition = mod.datetime.now(mod.timezone.utc)
+    with lock:
+        lock.set_phase("check", "release-one")
+        first_started = json.loads(loaded.status_path.read_text())["started_utc"]
+        assert mod.datetime.fromisoformat(first_started) >= first_acquisition
+
+        lock.set_phase("deploy", "release-one")
+        assert json.loads(loaded.status_path.read_text())["started_utc"] == first_started
+
+    second_acquisition = mod.datetime.now(mod.timezone.utc)
+    with lock:
+        lock.set_phase("check", "release-two")
+        second_status = json.loads(loaded.status_path.read_text())
+
+    assert second_status["pid"] == os.getpid()
+    assert mod.datetime.fromisoformat(second_status["started_utc"]) >= second_acquisition
+    assert second_status["started_utc"] != first_started
+
+
 def test_check_within_soft_budget_says_nothing(tmp_path, capsys, monkeypatch):
     repo = setup_repo(tmp_path, "fastcheck")
     wt = make_worktree(repo, "fast")

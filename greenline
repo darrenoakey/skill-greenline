@@ -453,6 +453,7 @@ class GateLock:
         self.slow_gate: dict | None = None
         self.wait_started: float | None = None
         self.acquired_at: float | None = None
+        self.phase_started_utc: str | None = None
 
     def __enter__(self):
         self.repo.ensure_state()
@@ -467,6 +468,7 @@ class GateLock:
         if not acquired:
             self._wait_with_status()
         self.acquired_at = time.monotonic()
+        self.phase_started_utc = None
         return self
 
     @property
@@ -509,10 +511,13 @@ class GateLock:
         self, phase: str, branch: str, started_utc: str | None = None
     ) -> None:
         st = read_json(self.repo.status_path) or {}
+        self.phase_started_utc = (
+            started_utc or self.phase_started_utc or utcstamp()
+        )
         st["pid"] = os.getpid()
         st["branch"] = branch
         st["phase"] = phase
-        st["started_utc"] = started_utc or st.get("started_utc") or utcstamp()
+        st["started_utc"] = self.phase_started_utc
         write_json(self.repo.status_path, st)
 
     def clear_status(self) -> None:
