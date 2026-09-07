@@ -30,7 +30,11 @@ def append_event(repo, event, **fields):
         stream.write(json.dumps({"event": event, "ts": datetime.now(timezone.utc).isoformat(), **fields}) + "\n")
 
 
-def wait_for_event(repo, event, branch=None, timeout=10):
+# Completion/startup waits below are pure event waits, not semantic bounds:
+# on a heavily loaded gate machine a full submit takes tens of seconds, so
+# they all get generous ceilings. The waiter script carries its own internal
+# 600s release bound; these timeouts only guard against a hung test.
+def wait_for_event(repo, event, branch=None, timeout=120):
     journal = common_dir(repo) / "greenline" / "journal.jsonl"
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -43,7 +47,7 @@ def wait_for_event(repo, event, branch=None, timeout=10):
     raise AssertionError(f"timed out waiting for {event} branch={branch}")
 
 
-def wait_for_path(path, timeout=10):
+def wait_for_path(path, timeout=120):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if path.exists():
@@ -112,8 +116,8 @@ def test_waiter_ignores_peer_span_before_its_exact_start(tmp_path):
             stderr=subprocess.STDOUT,
             text=True,
         )
-        own_output, _ = own_proc.communicate(timeout=20)
-        peer_output, _ = peer_proc.communicate(timeout=20)
+        own_output, _ = own_proc.communicate(timeout=120)
+        peer_output, _ = peer_proc.communicate(timeout=120)
 
         assert peer_proc.returncode == 0, peer_output
         assert own_proc.returncode == 0, own_output
@@ -153,7 +157,7 @@ def test_waiter_rejects_complete_attestation_when_owned_submit_exits_nonzero(tmp
         status = json.loads((common_dir(repo) / "greenline" / "status.json").read_text())
         greenline_pid = status["pid"]
         os.kill(greenline_pid, signal.SIGTERM)
-        output, _ = waiter.communicate(timeout=10)
+        output, _ = waiter.communicate(timeout=120)
 
         assert start["candidate_src_sha"] == run_git(own, "rev-parse", "HEAD")
         assert waiter.returncode != 0
@@ -188,7 +192,7 @@ def test_terminal_journal_failure_reaps_owned_submission_tree(tmp_path):
         greenline_pid = status["pid"]
         child_pid = int(wait_for_path(common_dir(repo) / "slow-child.pid").read_text())
         append_event(repo, "fail", branch="gl/terminal-owner", stage="injected-terminal")
-        output, _ = waiter.communicate(timeout=10)
+        output, _ = waiter.communicate(timeout=120)
 
         assert waiter.returncode == 1, output
         assert "event={" in output
@@ -216,7 +220,7 @@ def test_attach_uses_recorded_start_deadline_without_owning_process(tmp_path):
             [GREENLINE_WAIT, "--attach", "--repo", str(own), "gl/attach-owner"],
             capture_output=True,
             text=True,
-            timeout=3,
+            timeout=30,
         )
         assert result.returncode == 2
         assert "release deadline exceeded" in result.stdout

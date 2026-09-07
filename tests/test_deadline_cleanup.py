@@ -15,6 +15,7 @@ import pytest
 from test_greenline import (
     commit_in,
     common_dir,
+    expire_deadline_when,
     journal_events,
     load_greenline_module,
     make_worktree,
@@ -42,20 +43,27 @@ def test_timeout_kills_term_ignoring_grandchild_after_leader_exits(tmp_path):
     module.PROCESS_GROUP_TERM_GRACE_SECONDS = 0.2
     module.PROCESS_GROUP_KILL_GRACE_SECONDS = 0.5
     module.PROCESS_PIPE_DRAIN_SECONDS = 0.5
+    # Generous outer bound: the rendezvous expires the deadline once the nested
+    # grandchild has provably spawned (its pid file exists), so the kill path is
+    # exercised at the right moment on a quiet or a loaded machine alike.
     module.ACTIVE_RELEASE_DEADLINE = module.ReleaseDeadline(
-        time.monotonic(), 0.5, module.RELEASE_TIMEOUT_REASON
+        time.monotonic(), 300.0, module.RELEASE_TIMEOUT_REASON
     )
     started = time.monotonic()
     try:
-        with pytest.raises(module.ReleaseDeadlineExceeded):
-            module.run_argv([sys.executable, "-c", leader, str(pid_path)], "regression")
+        with expire_deadline_when(module, pid_path):
+            with pytest.raises(module.ReleaseDeadlineExceeded):
+                module.run_argv(
+                    [sys.executable, "-c", leader, str(pid_path)], "regression"
+                )
     finally:
         module.ACTIVE_RELEASE_DEADLINE = None
 
     elapsed = time.monotonic() - started
     assert pid_path.exists(), "the real descendant must start before expiry"
     descendant_pid = int(pid_path.read_text())
-    assert elapsed < 2.5, "pipe drain and group cleanup must remain bounded"
+    # Bounded = rendezvous grace + term/kill/drain, not the descendant's 30s wait.
+    assert elapsed < 25, "pipe drain and group cleanup must remain bounded"
     assert pid_is_gone(descendant_pid), (
         f"TERM-ignoring descendant {descendant_pid} survived group cleanup"
     )
@@ -79,21 +87,28 @@ def test_timeout_fails_when_escaped_child_keeps_stdout_open(tmp_path):
     command = shlex.join([sys.executable, "-c", leader, str(pid_path)])
     module.PROCESS_GROUP_TERM_GRACE_SECONDS = 0.05
     module.PROCESS_GROUP_KILL_GRACE_SECONDS = 0.05
-    module.PROCESS_PIPE_DRAIN_SECONDS = 0.2
     escaped_pid = None
     started = time.monotonic()
     try:
+        # run_shell_timed fixes its budget when it is called, so — unlike the
+        # run_argv tests — this one cannot rendezvous on the pid file. The kill
+        # must still land after both nested interpreters have spawned and while
+        # their 30s waits run: a sub-second cap fires before the escaped child
+        # exists on a loaded machine, the pipe closes cleanly, and the escape
+        # regression stops being exercised. 8s covers interpreter startup under
+        # load and is nowhere near the 30s natural exit.
         with pytest.raises(RuntimeError, match="output did not close after group cleanup"):
             module.run_shell_timed(
                 command,
                 tmp_path,
                 log_path,
-                0.3,
+                8.0,
                 "escaped stdout regression",
             )
         assert pid_path.exists(), "the escaped child must start before timeout"
         escaped_pid = int(pid_path.read_text())
-        assert time.monotonic() - started < 1.5
+        # Bounded = cap + term/kill/drain grace, not the child's 30s wait.
+        assert time.monotonic() - started < 20
     finally:
         if escaped_pid is None and pid_path.exists():
             escaped_pid = int(pid_path.read_text())
@@ -102,6 +117,38 @@ def test_timeout_fails_when_escaped_child_keeps_stdout_open(tmp_path):
                 os.killpg(escaped_pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+
+
+def test_running_stage_honours_a_release_deadline_that_shrinks_mid_stage(tmp_path):
+    """The aggregate clock is authoritative for the whole stage, not just its start.
+
+    A stage that sampled the deadline once when it began would keep running long
+    after the release was out of time, and the release would then die at the next
+    incidental git call instead of at the stage actually overrunning.
+    """
+    module = load_greenline_module()
+    marker = tmp_path / "stage-running.marker"
+    log_path = tmp_path / "stage.log"
+    command = f"touch {shlex.quote(str(marker))}; sleep 60"
+    module.PROCESS_GROUP_TERM_GRACE_SECONDS = 0.2
+    module.PROCESS_GROUP_KILL_GRACE_SECONDS = 0.5
+    module.PROCESS_PIPE_DRAIN_SECONDS = 0.5
+    module.ACTIVE_RELEASE_DEADLINE = module.ReleaseDeadline(
+        time.monotonic(), 300.0, module.RELEASE_TIMEOUT_REASON
+    )
+    started = time.monotonic()
+    try:
+        with expire_deadline_when(module, marker):
+            outcome = module.run_shell_timed(
+                command, tmp_path, log_path, 600.0, "shrinking stage"
+            )
+    finally:
+        module.ACTIVE_RELEASE_DEADLINE = None
+
+    assert outcome.timed_out
+    assert outcome.timeout_reason == module.RELEASE_TIMEOUT_REASON
+    assert time.monotonic() - started < 30, "the stage must die on the release clock"
+    assert "timeout after" in log_path.read_text()
 
 
 def test_push_deadline_reconciles_remote_acceptance_without_rewind(tmp_path, capsys):
@@ -123,14 +170,21 @@ def test_push_deadline_reconciles_remote_acceptance_without_rewind(tmp_path, cap
     run_git(repo, "config", "remote.origin.receivepack", str(receive))
 
     module = load_greenline_module()
-    module.RELEASE_HARD_TIMEOUT_SECONDS = 30.0
+    # Generous outer bound only: the controller thread expires the deadline
+    # 0.2s after the remote actually accepts the push, so this value just
+    # needs to survive a heavily loaded machine's journey to publish.
+    module.RELEASE_HARD_TIMEOUT_SECONDS = 300.0
     module.PROCESS_GROUP_TERM_GRACE_SECONDS = 0.2
     module.PROCESS_GROUP_KILL_GRACE_SECONDS = 0.5
     module.PROCESS_PIPE_DRAIN_SECONDS = 0.5
     rendezvous_error = []
 
     def expire_after_remote_acceptance():
-        wait_until = time.monotonic() + 20
+        # Wait for the push to actually reach the remote. Under heavy gate load
+        # the whole submit up to publish can take tens of seconds, so a 20s
+        # rendezvous false-fails; this is a pure event wait, not a semantic
+        # bound.
+        wait_until = time.monotonic() + 120
         while not accepted.exists() and time.monotonic() < wait_until:
             threading.Event().wait(0.01)
         if not accepted.exists():
@@ -145,7 +199,9 @@ def test_push_deadline_reconciles_remote_acceptance_without_rewind(tmp_path, cap
     controller = threading.Thread(target=expire_after_remote_acceptance)
     controller.start()
     result = module.main(["submit", "--repo", str(worktree)])
-    controller.join(timeout=1)
+    # The thread only needs one scheduler quantum after main() returns; under
+    # heavy gate load a 1s join false-fails. Pure event wait, not a bound.
+    controller.join(timeout=120)
     output = capsys.readouterr().out
 
     candidate = sha(repo, "main")

@@ -19,9 +19,42 @@ lint() {
     echo "==> lint passed"
 }
 
+pytest_run() {
+    # Doctrine: tests are isolated (per-test tmp repos, OS-assigned ports), so run
+    # them wide. xdist spreads individual tests across all cores (--dist load —
+    # test_greenline.py holds most of the suite, so per-file grouping would
+    # re-serialize it). Fall back to serial only if xdist is not installed.
+    if "${PY[@]}" -c "import xdist" 2>/dev/null; then
+        "${PY[@]}" -m pytest -x -q -n auto --dist load "$@"
+    else
+        "${PY[@]}" -m pytest -x -q "$@"
+    fi
+}
+
 test_all() {
     echo "==> test"
-    "${PY[@]}" -m pytest tests/ -x -q "$@"
+    if [ "$#" -gt 0 ]; then
+        pytest_run "$@"
+        echo "==> test passed"
+        return
+    fi
+    # Change-impact selection: run every test this candidate could break, and
+    # only those. The selector fails closed (unknown path -> whole suite), so
+    # product growth cannot silently escape validation OR inflate release time.
+    local targets
+    if ! targets="$("${PY[@]}" "$ROOT/scripts/impact_select.py")"; then
+        echo "==> test: impact selection unavailable — running the whole suite"
+        targets="$(ls tests/test_*.py)"
+    fi
+    if [ -z "$targets" ]; then
+        echo "==> test: candidate touches no tested behaviour — nothing to run"
+        echo "==> test passed"
+        return
+    fi
+    echo "==> test: selected by change impact:"
+    echo "$targets" | sed 's/^/      /'
+    # shellcheck disable=SC2086
+    pytest_run $targets
     echo "==> test passed"
 }
 

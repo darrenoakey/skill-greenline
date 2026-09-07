@@ -768,6 +768,23 @@ def run_shell_timed(
             if effective_timeout is not None
             else None
         )
+        command_started = time.monotonic()
+
+        def honour_release_deadline() -> None:
+            """Re-read the authoritative release clock, every loop.
+
+            The aggregate release deadline owns the whole release; a stage only
+            borrows what is left of it. Sampling it once when the stage starts
+            makes a long-running stage blind to the clock it is spending, so
+            re-anchor on it whenever it is the tighter of the two bounds.
+            """
+            nonlocal expires, deadline_limited
+            deadline = ACTIVE_RELEASE_DEADLINE
+            if deadline is None:
+                return
+            if expires is None or deadline.expires < expires:
+                expires = deadline.expires
+                deadline_limited = True
 
         def emit(data: bytes, final: bool = False) -> None:
             text = decoder.decode(data, final=final)
@@ -779,6 +796,8 @@ def run_shell_timed(
 
         try:
             while selector.get_map():
+                if not timed_out:
+                    honour_release_deadline()
                 remaining = None if expires is None else expires - time.monotonic()
                 if remaining is not None and remaining <= 0:
                     if timed_out:
@@ -787,7 +806,7 @@ def run_shell_timed(
                         )
                     timed_out = True
                     log.write(
-                        f"[timeout after {effective_timeout:.3f}s — killing process group]\n"
+                        f"[timeout after {time.monotonic() - command_started:.3f}s — killing process group]\n"
                     )
                     _kill_process_group(proc)
                     remaining = PROCESS_PIPE_DRAIN_SECONDS

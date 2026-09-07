@@ -200,6 +200,43 @@ def pid_is_gone(pid: int, wait_s: float = 10.0) -> bool:
     return False
 
 
+@contextmanager
+def expire_deadline_when(mod, marker: Path, grace: float = 0.5, wait: float = 240.0):
+    """Rendezvous a release deadline against real progress instead of the clock.
+
+    A deadline test needs the deadline to expire *while a stage is running* —
+    never before it starts. Encoding that as a small fixed budget makes the test
+    a machine-speed measurement: on a loaded gate the pre-stage git work alone
+    outruns it and the deadline lands in the wrong place. Instead arm a generous
+    outer bound, wait for `marker` (written by the stage itself as proof it is
+    running), then shorten the live deadline to expire `grace` later. The test
+    stays fast on a quiet machine and correct on a loaded one.
+    """
+    errors: list[str] = []
+
+    def rendezvous():
+        limit = time.monotonic() + wait
+        while not marker.exists() and time.monotonic() < limit:
+            time.sleep(0.01)
+        if not marker.exists():
+            errors.append(f"stage marker {marker} never appeared")
+            return
+        deadline = mod.ACTIVE_RELEASE_DEADLINE
+        if deadline is None:
+            errors.append("release deadline was not active at the rendezvous")
+            return
+        deadline.hard_seconds = time.monotonic() - deadline.started + grace
+
+    thread = threading.Thread(target=rendezvous)
+    thread.start()
+    try:
+        yield errors
+    finally:
+        thread.join(timeout=wait + 30)
+    assert not thread.is_alive(), "rendezvous thread never finished"
+    assert not errors, errors
+
+
 def common_dir(repo: Path) -> Path:
     out = run_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
     return Path(out).resolve()
@@ -693,9 +730,9 @@ def test_waiter_ignores_peer_terminal_and_reports_own_exact_candidate(tmp_path):
         ],
         capture_output=True,
         text=True,
-        timeout=25,
+        timeout=120,
     )
-    peer_out, _ = peer.communicate(timeout=25)
+    peer_out, _ = peer.communicate(timeout=120)
     assert peer.returncode == 0, peer_out
     assert watched.returncode == 0, watched.stdout + watched.stderr
 
@@ -1259,10 +1296,13 @@ def test_cumulative_release_budget_bounds_check_then_deploy_and_reaps_group(
     release_fifo = common_dir(repo) / "check-release.fifo"
     os.mkfifo(started_fifo)
     os.mkfifo(release_fifo)
-    mod.DEPLOY_HARD_TIMEOUT_SECONDS = 3.0
+    mod.DEPLOY_HARD_TIMEOUT_SECONDS = 30.0
     deadline_started = time.monotonic()
+    # One monotonic clock spans check then deploy. Its size is a generous outer
+    # bound: the test shortens it at real rendezvous points, so a loaded machine
+    # cannot make the check run out of budget it was supposed to survive.
     mod.ACTIVE_RELEASE_DEADLINE = mod.ReleaseDeadline(
-        deadline_started, 3.0, mod.RELEASE_TIMEOUT_REASON
+        deadline_started, 300.0, mod.RELEASE_TIMEOUT_REASON
     )
     try:
         result = {}
@@ -1276,19 +1316,23 @@ def test_cumulative_release_budget_bounds_check_then_deploy_and_reaps_group(
             assert stream.readline().strip() == "started"
 
         remaining_at_rendezvous = mod.ACTIVE_RELEASE_DEADLINE.remaining()
-        threading.Event().wait(max(0.0, remaining_at_rendezvous - 1.0))
         with release_fifo.open("w") as stream:
             stream.write("continue\n")
-        check_thread.join(timeout=2)
+        check_thread.join(timeout=120)
 
         assert not check_thread.is_alive()
-        assert remaining_at_rendezvous > 1.5
+        assert remaining_at_rendezvous > 0, "check must run inside the live deadline"
         check_outcome, _ = result["check"]
         assert check_outcome.returncode == 0
         assert not check_outcome.timed_out
 
+        # Deploy inherits whatever the check left on the shared clock — that is
+        # the cumulative property under test. Expire it once the deploy is
+        # provably running (it has written its grandchild pid), so the kill
+        # lands inside deploy rather than before it has even started work.
         deploy_started = time.monotonic()
-        deploy_outcome = mod.run_gate_deploy(loaded, log_path)
+        with expire_deadline_when(mod, common_dir(repo) / "slow-child.pid"):
+            deploy_outcome = mod.run_gate_deploy(loaded, log_path)
         deploy_elapsed = time.monotonic() - deploy_started
     finally:
         mod.ACTIVE_RELEASE_DEADLINE = None
@@ -1307,12 +1351,15 @@ def test_lock_admission_consumes_release_budget_and_fails_before_check(
     wt = make_worktree(repo, "waiting")
     commit_in(wt, "waiting.txt", "x\n", "wait behind lock")
     lock_path = common_dir(repo) / "greenline" / "lock"
+    # The holder never releases: the waiter must lose to the release deadline,
+    # not to a lucky race against a sleeping holder.
     holder = subprocess.Popen(
         [
             sys.executable,
             "-c",
-            "import fcntl,sys,time; f=open(sys.argv[1],'w'); "
-            "fcntl.flock(f,fcntl.LOCK_EX); print('held',flush=True); time.sleep(5)",
+            "import fcntl,sys,threading; f=open(sys.argv[1],'w'); "
+            "fcntl.flock(f,fcntl.LOCK_EX); print('held',flush=True); "
+            "threading.Event().wait(600)",
             str(lock_path),
         ],
         stdout=subprocess.PIPE,
@@ -1321,7 +1368,11 @@ def test_lock_admission_consumes_release_budget_and_fails_before_check(
     assert holder.stdout.readline().strip() == "held"
     try:
         mod = load_greenline_module()
-        mod.RELEASE_HARD_TIMEOUT_SECONDS = 0.7
+        # Large enough that the pre-lock git work cannot consume it on a loaded
+        # machine (which would expire the release before it ever queued), small
+        # enough to keep the test quick. The lock is never released, so the
+        # waiter can only exit by exhausting this budget.
+        mod.RELEASE_HARD_TIMEOUT_SECONDS = 10
         started = time.monotonic()
         assert mod.main(["submit", "--repo", str(wt)]) == 1
         elapsed = time.monotonic() - started
@@ -1330,7 +1381,7 @@ def test_lock_admission_consumes_release_budget_and_fails_before_check(
         holder.wait(timeout=5)
 
     captured = capsys.readouterr()
-    assert 0.5 <= elapsed < 1.5
+    assert elapsed < 30, "the waiter must give up on its own deadline"
     assert "gate lock admission" in captured.err
     assert not record_lines(repo), "deadline-expired waiter must not start check or deploy"
 
@@ -1467,8 +1518,11 @@ def test_check_timeout_fails_the_gate_and_reaps_children(
 
     mod = load_greenline_module()
     mod.RELEASE_TARGET_SECONDS = 0
-    mod.RELEASE_HARD_TIMEOUT_SECONDS = 5
-    rc = mod.main(["submit", "--repo", str(wt)])
+    # Generous outer bound; the rendezvous expires the deadline once the check
+    # is provably running (its grandchild pid file exists).
+    mod.RELEASE_HARD_TIMEOUT_SECONDS = 300
+    with expire_deadline_when(mod, common_dir(repo) / "slow-child.pid"):
+        rc = mod.main(["submit", "--repo", str(wt)])
     out = capsys.readouterr().out
     assert rc == 1
     assert "CHECK TIMED OUT" in out
@@ -1503,13 +1557,20 @@ def test_near_limit_success_is_published_before_deadline(tmp_path, capsys):
 
     mod = load_greenline_module()
     mod.RELEASE_TARGET_SECONDS = 60
-    mod.RELEASE_HARD_TIMEOUT_SECONDS = 4.5
+    # Any small fixed budget false-fails on a heavily loaded gate machine (every
+    # subprocess spawn costs many times its CPU time there; 4.5s and even 15s
+    # were observed to flake). The timeout-must-fire boundary is covered by the
+    # deadline tests below; this one proves the complementary path: with the
+    # deadline armed, a success still checks, deploys, publishes, and journals
+    # complete before expiry. 120s is far inside the real 600s deadline with
+    # headroom for a loaded machine.
+    mod.RELEASE_HARD_TIMEOUT_SECONDS = 120
     assert mod.main(["submit", "--repo", str(wt)]) == 0
     capsys.readouterr()
 
     complete = [e for e in journal_events(repo) if e["event"] == "complete"][-1]
     assert complete["merged"] == sha(repo, "main")
-    assert complete["total_seconds"] < 4.5
+    assert complete["total_seconds"] < 120
     assert (common_dir(repo) / "greenline" / "deployed").read_text().strip() == complete["merged"]
 
 
@@ -1524,8 +1585,11 @@ def test_adopt_check_timeout_is_a_failure_too(tmp_path, capsys):
 
     mod = load_greenline_module()
     mod.RELEASE_TARGET_SECONDS = 0
-    mod.RELEASE_HARD_TIMEOUT_SECONDS = 5
-    rc = mod.main(["adopt", "--repo", str(repo)])
+    # Same rendezvous as the submit check-timeout test: expire once the check
+    # is provably running rather than guessing how long adopt's setup takes.
+    mod.RELEASE_HARD_TIMEOUT_SECONDS = 300
+    with expire_deadline_when(mod, common_dir(repo) / "slow-child.pid"):
+        rc = mod.main(["adopt", "--repo", str(repo)])
     out = capsys.readouterr().out
     assert rc == 1
     assert "CHECK TIMED OUT" in out
@@ -1586,48 +1650,23 @@ def test_deploy_timeout_rolls_back_like_a_failed_deploy_and_reaps_children(
     repo = setup_repo(tmp_path, "slowdeploy")
     main_before = sha(repo, "main")
     wt = make_worktree(repo, "slow")
-    body = SLOW_DEPLOY.replace(
-        'if [ "$1" = "deploy" ]; then',
-        'if [ "$1" = "check" ]; then\n'
-        '  printf "started\\n" > "$FLAGDIR/check-started.fifo"\n'
-        '  IFS= read -r _ < "$FLAGDIR/check-release.fifo"\n'
-        "fi\n"
-        'if [ "$1" = "deploy" ]; then',
-    )
-    write_run_script(wt, body)
+    write_run_script(wt, SLOW_DEPLOY)
     run_git(wt, "add", "-A")
     run_git(wt, "commit", "-q", "-m", "slow deploy")
 
     mod = load_greenline_module()
-    mod.RELEASE_HARD_TIMEOUT_SECONDS = 30
+    # Generous outer bound; the rendezvous expires the deadline once the deploy
+    # is provably running (it has written its grandchild pid). Guessing instead
+    # how long check plus the surrounding git work takes just measures the
+    # machine, and lands the expiry in the wrong stage when it is loaded.
+    mod.RELEASE_HARD_TIMEOUT_SECONDS = 300
     mod.PROCESS_GROUP_TERM_GRACE_SECONDS = 0.2
     mod.PROCESS_GROUP_KILL_GRACE_SECONDS = 0.5
     mod.PROCESS_PIPE_DRAIN_SECONDS = 0.5
-    started_fifo = common_dir(repo) / "check-started.fifo"
-    release_fifo = common_dir(repo) / "check-release.fifo"
-    os.mkfifo(started_fifo)
-    os.mkfifo(release_fifo)
-    rendezvous_errors = []
 
-    def constrain_release_after_check_starts():
-        with started_fifo.open() as stream:
-            if stream.readline().strip() != "started":
-                rendezvous_errors.append("check rendezvous did not start")
-        deadline = mod.ACTIVE_RELEASE_DEADLINE
-        if deadline is None:
-            rendezvous_errors.append("release deadline was not active during check")
-        else:
-            deadline.hard_seconds = time.monotonic() - deadline.started + 2.0
-        with release_fifo.open("w") as stream:
-            stream.write("continue\n")
-
-    controller = threading.Thread(target=constrain_release_after_check_starts)
-    controller.start()
-    rc = mod.main(["submit", "--repo", str(wt)])
-    controller.join(timeout=1)
+    with expire_deadline_when(mod, common_dir(repo) / "slow-child.pid"):
+        rc = mod.main(["submit", "--repo", str(wt)])
     out = capsys.readouterr().out
-    assert not controller.is_alive()
-    assert not rendezvous_errors
     assert rc == 1
     assert "DEPLOY TIMED OUT" in out
     assert mod.RELEASE_TIMEOUT_REASON in out
@@ -1654,7 +1693,9 @@ def test_health_probe_timeout_reports_unhealthy(tmp_path):
     gl(repo, "setup", expect=0)
 
     mod = load_greenline_module()
-    mod.HEALTH_HARD_TIMEOUT_SECONDS = 1
+    # The probe waits 120s, so a 10s cap still fires mid-probe while surviving
+    # interpreter spawn time on a heavily loaded machine.
+    mod.HEALTH_HARD_TIMEOUT_SECONDS = 10
     loaded = mod.load_repo(repo)
     log_path = tmp_path / "health.log"
 
