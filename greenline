@@ -1049,7 +1049,10 @@ def ensure_gate_worktree(repo: Repo) -> None:
     """Ensure the gate worktree exists, is healthy, and is reset to main tip."""
     gate = repo.gate_path
     main = repo.main_branch
-    healthy = gate.exists() and is_git_repo(gate)
+    # A git worktree always carries a .git marker; whether git still knows about
+    # it is settled authoritatively by list_worktrees just below, so the marker
+    # is the whole filesystem question and needs no subprocess of its own.
+    healthy = gate.exists() and (gate / ".git").exists()
     if healthy:
         # confirm git knows about it
         known = any(
@@ -1065,11 +1068,14 @@ def ensure_gate_worktree(repo: Repo) -> None:
             git(repo.canonical, "worktree", "prune")
         gate.parent.mkdir(parents=True, exist_ok=True)
         git(repo.canonical, "worktree", "add", "--detach", str(gate), main)
-    # self-heal a crash mid-squash: a conflicted index blocks checkout
-    git(gate, "merge", "--abort", check=False)
-    git(gate, "reset", "--hard", "HEAD", check=False)
-    # hard reset + clean to main tip
-    git(gate, "checkout", "--detach", main)
+    # Reset to the main tip. The happy path is a clean detached gate, which
+    # needs exactly two commands; the crash-mid-squash path (conflicted index
+    # or dirty tree blocking checkout) self-heals and retries. Paying for that
+    # self-heal on every release is pure spawn cost on the release clock.
+    if git(gate, "checkout", "--detach", main, check=False).returncode != 0:
+        git(gate, "merge", "--abort", check=False)
+        git(gate, "reset", "--hard", "HEAD", check=False)
+        git(gate, "checkout", "--detach", main)
     git(gate, "reset", "--hard", main)
     # -fd, deliberately NOT -fdx: gitignored files (venvs, record/replay
     # caches) are the gate worktree's intended persistent state — they are

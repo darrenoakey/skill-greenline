@@ -792,6 +792,41 @@ def test_conflict_candidate_fails_fast_and_gate_reusable(tmp_path):
     gl(repo, "submit", "--repo", str(wt3), expect=0)
 
 
+def test_gate_self_heals_a_tree_left_behind_by_a_crash(tmp_path):
+    """A gate killed mid-squash must not wedge the next release.
+
+    The reset sequence pays for its self-heal only when it is needed, so this
+    plants exactly the state a crash leaves — the gate detached at an older main
+    with a conflicting local edit, which makes `checkout --detach main` refuse —
+    and requires the next submission to recover and pass on its own.
+    """
+    repo = setup_repo(tmp_path, "gatecrash")
+    first = make_worktree(repo, "one")
+    commit_in(first, "app.txt", "mainline change\n", "first change")
+    stale = sha(repo, "main")
+    gl(repo, "submit", "--repo", str(first), expect=0)
+
+    gate = tmp_path / "wt" / "gatecrash" / "gate"
+    run_git(gate, "checkout", "--detach", stale)
+    (gate / "app.txt").write_text("half-finished squash\n")
+    assert run_git(gate, "status", "--porcelain"), "precondition: gate is dirty"
+    blocked = subprocess.run(
+        ["git", "-C", str(gate), "checkout", "--detach", "main"],
+        capture_output=True,
+        text=True,
+    )
+    assert blocked.returncode != 0, "precondition: this state must block checkout"
+
+    second = make_worktree(repo, "two")
+    commit_in(second, "second.txt", "ok\n", "second change")
+    gl(repo, "submit", "--repo", str(second), expect=0)
+
+    assert (repo / "second.txt").exists()
+    assert (repo / "app.txt").read_text() == "mainline change\n"
+    assert not run_git(gate, "status", "--porcelain"), "gate must end clean"
+    assert sha(gate, "HEAD") == sha(repo, "main")
+
+
 def test_empty_candidate_refused(tmp_path):
     repo = setup_repo(tmp_path)
     wt = make_worktree(repo, "empty")
