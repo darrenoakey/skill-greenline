@@ -11,7 +11,7 @@ before writing code or tests.
 
 **Your workflow:**
 1. `greenline worktree <name>` — get a worktree at `{worktree_base}/<name>` on branch `gl/<name>`.
-2. Do your work there. Co-design tests + code per docs/DOCTRINE.md (parallel-safe, namespaced, no global-state assertions, OS-assigned ports; never mock other services — make real calls fast with a content-addressed record/replay cache).
+2. Do your work there. Co-design tests + code per docs/DOCTRINE.md (parallel-safe, namespaced, no global-state assertions, OS-assigned ports, probe the exact host:port instead of machine-wide `lsof`/`netstat`/`ss`/`fuser` scans; never mock other services — make real calls fast with a content-addressed record/replay cache).
 3. Commit in your worktree. Then `greenline submit` (from that worktree).
 4. The gate squash-merges, runs `{check}`, fast-forwards `{main_branch}`, runs `{deploy}`, and publishes. It rolls back prod automatically if deploy fails.
 5. On success: `greenline done` to remove your worktree + branch.

@@ -87,6 +87,7 @@ Tests run in parallel with each other, with other agents' runs, and with live pr
 Therefore: namespace every entity a test creates (uuid suffixes); never assert global
 state (counts, "table empty", singletons); never truncate/reset shared stores; tolerate
 pre-existing and concurrently-changing data; bind servers to OS-assigned ports (port 0);
+probe the exact host:port you own (TCP dial / unix connect) instead of `lsof`, `netstat`, `ss`, `fuser`, or other system-wide scans;
 prefer per-test datastores (tmp sqlite, worktree-relative `local/`); keep schema
 migrations backward-compatible one version (deploy rollback runs the previous code against
 the new schema); serialize tests that share a scarce resource (a local LLM server, one GPU).

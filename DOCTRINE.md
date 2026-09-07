@@ -70,6 +70,14 @@ the tests themselves are designed **together** to survive this environment:
 - **Bind servers to OS-assigned ports (port 0), never fixed ports.** Two `check`
   runs binding `:8080` is an instant, confusing failure. Ask the OS for a port and
   read back what you got.
+- **Probe the exact host:port (or unix socket) you own. Never scan the machine.**
+  `lsof`, `netstat -a`/`-anv`, `ss`, `fuser`, `lsof +D`, and `ps -ax`/`ps aux` are
+  system-wide scans: they burn CPU, race with parallel checks, and can mis-attribute
+  unrelated processes. Dial or connect the specific address, or bind port 0 and read
+  the assigned port back. If you need a process identity, read that one PID (pidfile
+  you wrote, `/proc/<pid>`, `kern.proc.pid`). If you cannot identify a listener
+  without a machine-wide scan, fail closed and leave it alone. Do not replace one
+  scan with a worse one.
 - **Prefer per-test / per-worktree datastores where cheap.** A `tmp_path` sqlite
   file, a worktree-relative `local/` dir — isolation by construction beats
   careful namespacing.
