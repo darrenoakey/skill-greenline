@@ -143,7 +143,15 @@ correctness.
 
 You are already inside a fresh greenline worktree for this repo — this \
 directory is it. Read this repo's docs/DOCTRINE.md, section "The release time \
-budget", for the house rules before you start.
+budget", for the house rules before you start — that one section only, not \
+the whole file.
+
+Token discipline: earlier speed-up runs burned their budget re-reading \
+reference material and dumping logs. This prompt plus the slow run's log is \
+your spec — do NOT read the greenline or improve SKILL.md files or any other \
+skill docs. Never dump whole logs or full git history: grep the log for the \
+stage timing lines, and use `git log --oneline -n 20` and targeted single-commit \
+diffs only.
 
 {log_line}
 Do:
@@ -167,6 +175,9 @@ Never wait for load, rearm a TTL, or retry unchanged.
 Do not declare the speed-up complete while the measured cause persists. Small \
 landed improvements are release boundaries, not a reduced completion criterion: \
 keep going until the release meets the target.
+
+Re-read nothing you already have in context: every tool call should either \
+produce a new measurement or land/verify an edit.
 """
 
 
