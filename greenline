@@ -1230,7 +1230,7 @@ def recover_incomplete(repo: Repo, inc: dict, log_path: Path) -> None:
         last_green = rev(repo.canonical, LAST_GREEN_REF)
         if deployed == tip and health_probe(repo, log_path):
             if remote_exists(repo.canonical):
-                publish(repo, tip)
+                publish_adopt_tip(repo, tip, log_path)
             set_last_green(repo, tip)
             journal(repo, "complete", merged=tip, adopt=True, note="recovered_adopt")
         else:
@@ -1468,6 +1468,49 @@ def publish(repo: Repo, sha: str) -> None:
     finally:
         with contextlib.suppress(FileNotFoundError):
             repo.allow_push_path.unlink()
+
+
+def publish_adopt_tip(repo: Repo, tip: str, log_path: Path) -> None:
+    """Publish an adopted tip, tolerating an origin that moved ahead mid-gate.
+
+    An adopt gates the LOCAL main tip, which usually arrived from origin in
+    the first place; pushing it back is a mirror, not new content. When a PR
+    merged while the gate ran, origin/main is a strict descendant of the tip
+    and the plain push is rejected non-fast-forward — stranding a tip that
+    already passed check and deploy, with last-green unable to advance, so
+    every later gate dies at the same push (agentd3 2026-09-19: PR 12 merged
+    between two green adopts of 80b0ff64). In that regime the mirror is
+    content-complete by definition — everything gated is already on origin —
+    so it is skipped and set_last_green records the gated+deployed tip.
+    preflight_reconcile's ordinary origin handling then fast-forwards main to
+    the newer origin tip and directs the next adopt at it. Origin is never
+    rewritten; a sideways or diverged origin still raises for a human.
+    """
+    try:
+        publish(repo, tip)
+        return
+    except GitError:
+        origin = exact_origin_main(repo)
+        if not origin:
+            raise
+        if (
+            git(
+                repo.canonical,
+                "merge-base",
+                "--is-ancestor",
+                tip,
+                origin,
+                check=False,
+            ).returncode
+            != 0
+        ):
+            raise  # origin diverged or moved sideways: a human must reconcile
+        say(
+            "greenline: origin/main moved past the adopted tip mid-gate "
+            f"({short(repo.canonical, tip)} is an ancestor of "
+            f"{short(repo.canonical, origin)}); mirror push skipped — tip "
+            "was gated+deployed, last-green advances to it"
+        )
 
 
 def exact_origin_main(repo: Repo) -> str | None:
@@ -2222,10 +2265,23 @@ def cmd_adopt(args) -> int:
                 pre_main=last_green,
             )
 
-            # check at the main tip in the gate worktree
+            # check at the main tip in the gate worktree. HEAD is main, so
+            # merge-base(HEAD, main) is HEAD and `./run check` would see an
+            # empty path list and run the full suite (live 2026-09-19: two
+            # adopt attempts died at 600s in 17-database prep). The impact of
+            # adopt is last-green..main; AGENTD3_CHECK_BASE is the existing
+            # check-harness override for that baseline.
             lock.set_phase("checking", "adopt")
-            say(f"checking main tip {short(repo.canonical, tip)} ...")
-            check_outcome, check_seconds = run_gate_check(repo, repo.gate_path, log_path)
+            say(f"checking main tip {short(repo.canonical, tip)} against last-green {short(repo.canonical, last_green)} ...")
+            previous_base = os.environ.get("AGENTD3_CHECK_BASE")
+            os.environ["AGENTD3_CHECK_BASE"] = last_green
+            try:
+                check_outcome, check_seconds = run_gate_check(repo, repo.gate_path, log_path)
+            finally:
+                if previous_base is None:
+                    os.environ.pop("AGENTD3_CHECK_BASE", None)
+                else:
+                    os.environ["AGENTD3_CHECK_BASE"] = previous_base
             if check_outcome.returncode != 0 or check_outcome.timed_out:
                 journal(
                     repo,
@@ -2322,7 +2378,7 @@ def cmd_adopt(args) -> int:
             release_remaining("publish")
             publish_started = time.monotonic()
             if remote_exists(repo.canonical):
-                publish(repo, tip)
+                publish_adopt_tip(repo, tip, log_path)
             set_last_green(repo, tip)
             publish_seconds = time.monotonic() - publish_started
             total_seconds = time.monotonic() - release_started
