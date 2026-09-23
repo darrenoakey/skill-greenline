@@ -21,6 +21,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tomllib
@@ -314,6 +315,10 @@ class Repo:
         return self.state_dir / "deployed"
 
     @property
+    def retired_path(self) -> Path:
+        return self.state_dir / "retired.json"
+
+    @property
     def allow_push_path(self) -> Path:
         return self.state_dir / "allow-push"
 
@@ -455,13 +460,40 @@ def load_repo(start: str | Path | None) -> Repo:
 
 
 # --------------------------------------------------------------------------
+# retirement: shared git-dir, not a checkout's tracked files
+# --------------------------------------------------------------------------
+def retired_successor(repo: Repo) -> str | None:
+    if not repo.retired_path.exists():
+        return None
+    try:
+        data = json.loads(repo.retired_path.read_text())
+    except (OSError, ValueError) as exc:
+        die(f"RETIRED marker {repo.retired_path} is unreadable: {exc}", 2)
+    successor = data.get("successor") if isinstance(data, dict) else None
+    if not isinstance(successor, str) or not successor:
+        die(f"RETIRED marker {repo.retired_path} has no successor", 2)
+    return successor
+
+
+def require_active(repo: Repo) -> None:
+    successor = retired_successor(repo)
+    if successor:
+        die(f"RETIRED source {repo.canonical}; use {successor} via GitHub PR. "
+            "Greenline release and source mutations are disabled; rollback refs remain readable.", 2)
+
+
+# --------------------------------------------------------------------------
 # lock + status
 # --------------------------------------------------------------------------
 class GateLock:
     """The original simple exclusive flock, bounded by the release clock."""
 
-    def __init__(self, repo: Repo):
+    def __init__(
+        self, repo: Repo, *, allow_retired: bool = False, fail_if_busy: bool = False
+    ):
         self.repo = repo
+        self.allow_retired = allow_retired
+        self.fail_if_busy = fail_if_busy
         self.fh = None
         self.slow_gate: dict | None = None
         self.wait_started: float | None = None
@@ -479,7 +511,18 @@ class GateLock:
         except OSError:
             pass
         if not acquired:
+            if self.fail_if_busy:
+                self.fh.close()
+                die(f"active gate owns {self.repo.lock_path}; cannot retire now", 2)
             self._wait_with_status()
+        # A submit may have passed the early guard before a concurrent retire
+        # obtained the lock. Recheck while holding it, before reconciliation.
+        if not self.allow_retired:
+            try:
+                require_active(self.repo)
+            except BaseException:
+                self.__exit__(None, None, None)
+                raise
         self.acquired_at = time.monotonic()
         self.phase_started_utc = None
         return self
@@ -2587,6 +2630,39 @@ def cmd_deploy_pending(args) -> int:
             lock.clear_status()
 
 
+def cmd_retire(args) -> int:
+    """Retire source-update authority without removing history or runtime paths."""
+    repo = load_repo(args.repo)
+    successor = Path(args.successor).expanduser().resolve()
+    if not is_git_repo(successor) or canonical_path(successor) == repo.canonical:
+        die(f"successor must be a different, existing git repository: {successor}", 2)
+    with GateLock(repo, allow_retired=True, fail_if_busy=True):
+        if last_incomplete_gate(repo) is not None:
+            die("incomplete gate must be reconciled before source retirement", 2)
+        existing = retired_successor(repo)
+        if existing and existing != str(successor):
+            die(f"RETIRED source already points at {existing}; refusing to repoint", 2)
+        if not existing:
+            fd, name = tempfile.mkstemp(prefix=".retired-", dir=repo.state_dir)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                    json.dump({"successor": str(successor)}, stream)
+                    stream.write("\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(name, repo.retired_path)
+                directory = os.open(repo.state_dir, os.O_RDONLY)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+            finally:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(name)
+    say(f"RETIRED {repo.canonical} -> {successor}; use a GitHub PR. Rollback refs retained.")
+    return 0
+
+
 def cmd_status(args) -> int:
     repo = load_repo(args.repo)
     canon = repo.canonical
@@ -2639,6 +2715,8 @@ def cmd_status(args) -> int:
     say(f"gate     : {gate} [{gate_state}]")
     logs = sorted(repo.logs_dir.glob("*.log")) if repo.logs_dir.exists() else []
     say(f"last log : {logs[-1] if logs else '-'}")
+    if repo.retired_path.exists():
+        say(f"authority: RETIRED -> {retired_successor(repo)} (GitHub PR; refs retained)")
     return 0
 
 
@@ -2762,6 +2840,11 @@ def build_parser() -> argparse.ArgumentParser:
     add_repo(sp)
     sp.set_defaults(func=cmd_deploy_pending)
 
+    sp = sub.add_parser("retire", help="retire source releases; keep runtime paths and rollback refs")
+    sp.add_argument("--successor", required=True, help="GitHub PR successor repository path")
+    add_repo(sp)
+    sp.set_defaults(func=cmd_retire)
+
     sp = sub.add_parser("status", help="show gate + drift state (no lock)")
     add_repo(sp)
     sp.set_defaults(func=cmd_status)
@@ -2793,6 +2876,12 @@ def main(argv: list[str] | None = None) -> int:
 
             signal.signal(signal.SIGTERM, cancel_release)
     try:
+        # Resolve through the git common-dir so --repo and worktree aliases
+        # share the same retirement guard before any git or service mutation.
+        if args.cmd not in {"retire", "status"} and not (
+            args.cmd == "doctor" and not args.fix
+        ):
+            require_active(load_repo(args.repo))
         return args.func(args)
     except ReleaseDeadlineExceeded as exc:
         warn(f"RELEASE DEADLINE FAILED — {exc}")

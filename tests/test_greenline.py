@@ -636,6 +636,114 @@ def test_setup_commits_its_own_scaffolding(tmp_path):
     run_git(repo, "clean", "-fd")
 
 
+def test_retired_repo_blocks_release_from_canonical_and_worktree(tmp_path):
+    repo = setup_repo(tmp_path, "legacy")
+    alias = make_worktree(repo, "legacy-alias")
+    successor = make_repo(tmp_path, "successor", RUN_RECORDER)
+    original_main = sha(repo, "main")
+    original_green = sha(repo, "refs/greenline/last-green")
+    record = common_dir(repo) / "gl-record.log"
+    before = record.read_bytes() if record.exists() else b""
+
+    gl(alias, "retire", "--successor", str(successor), expect=0)
+    marker = common_dir(repo) / "greenline" / "retired.json"
+    assert json.loads(marker.read_text()) == {"successor": str(successor.resolve())}
+    first = marker.read_bytes()
+
+    # Every invocation is a fresh CLI process: the marker survives restart,
+    # follows the shared git common-dir from aliases, and refuses before any
+    # check, deploy, main-ref move, worktree creation or journal entry.
+    for cwd, command in (
+        (repo, ("submit", "gl/legacy-alias")),
+        (alias, ("submit", "gl/legacy-alias")),
+        (repo, ("adopt",)),
+        (alias, ("adopt",)),
+        (repo, ("deploy-pending",)),
+        (alias, ("doctor", "--fix")),
+        (alias, ("worktree", "no-new-branch")),
+        (alias, ("done", "--force")),
+        (repo, ("setup",)),
+    ):
+        result = gl(cwd, *command, expect=2)
+        assert "RETIRED" in result.stderr and str(successor) in result.stderr
+        assert "GitHub PR" in result.stderr
+    assert gl(repo, "status", expect=0).stdout.find("RETIRED") >= 0
+    assert gl(alias, "status", expect=0).stdout.find("RETIRED") >= 0
+    gl(repo, "retire", "--successor", str(successor), expect=0)
+    assert marker.read_bytes() == first
+    assert sha(repo, "main") == original_main
+    assert sha(repo, "refs/greenline/last-green") == original_green
+    assert alias.exists() and not (repo.parent / "wt" / "legacy" / "no-new-branch").exists()
+    assert (record.read_bytes() if record.exists() else b"") == before
+    assert not run_git(repo, "status", "--porcelain")
+
+
+def test_queued_release_rechecks_retirement_after_gate_lock(tmp_path):
+    repo = setup_repo(tmp_path, "legacy")
+    branch = make_worktree(repo, "queued")
+    (branch / "app.txt").write_text("v1\n")
+    run_git(branch, "add", "app.txt")
+    run_git(branch, "commit", "-q", "-m", "queued candidate")
+    successor = make_repo(tmp_path, "successor", RUN_RECORDER)
+    lock = common_dir(repo) / "greenline" / "lock"
+    main_before = sha(repo, "main")
+    with lock.open("w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        process = subprocess.Popen(
+            [sys.executable, "-u", GREENLINE, "submit", "gl/queued", "--repo", str(branch)],
+            cwd=branch,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        first_line = process.stdout.readline()
+        assert "gate busy" in first_line, (first_line, process.poll(), process.stderr.read())
+        marker = common_dir(repo) / "greenline" / "retired.json"
+        marker.write_text(json.dumps({"successor": str(successor.resolve())}) + "\n")
+        fcntl.flock(held, fcntl.LOCK_UN)
+    stdout, stderr = process.communicate(timeout=10)
+    assert process.returncode == 2, (stdout, stderr)
+    assert "RETIRED" in stderr and "GitHub PR" in stderr
+    assert sha(repo, "main") == main_before
+    assert not (common_dir(repo) / "gl-record.log").exists()
+
+
+def test_retirement_does_not_block_an_unrelated_repo(tmp_path):
+    legacy = setup_repo(tmp_path, "legacy")
+    unrelated = setup_repo(tmp_path, "unrelated")
+    successor = make_repo(tmp_path, "successor", RUN_RECORDER)
+    gl(legacy, "retire", "--successor", str(successor), expect=0)
+
+    feature = make_worktree(unrelated, "normal-release")
+    (feature / "app.txt").write_text("new work\n")
+    run_git(feature, "add", "app.txt")
+    run_git(feature, "commit", "-q", "-m", "unrelated release")
+    gl(feature, "submit", "gl/normal-release", expect=0)
+    assert run_git(unrelated, "show", "main:app.txt") == "new work"
+    record = common_dir(unrelated) / "gl-record.log"
+    assert "check " in record.read_text() and "deploy " in record.read_text()
+    assert not (common_dir(unrelated) / "greenline" / "retired.json").exists()
+
+
+def test_retire_refuses_active_gate_without_waiting_or_writing_marker(tmp_path):
+    repo = setup_repo(tmp_path, "legacy")
+    successor = make_repo(tmp_path, "successor", RUN_RECORDER)
+    lock = common_dir(repo) / "greenline" / "lock"
+    with lock.open("w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        result = gl(repo, "retire", "--successor", str(successor), expect=2)
+        assert "active gate" in result.stderr
+    assert not (common_dir(repo) / "greenline" / "retired.json").exists()
+
+
+def test_retire_requires_real_git_successor_before_any_state(tmp_path):
+    repo = setup_repo(tmp_path, "legacy")
+    bad = tmp_path / "not-a-repo"
+    result = gl(repo, "retire", "--successor", str(bad), expect=2)
+    assert "successor" in result.stderr
+    assert not (common_dir(repo) / "greenline" / "retired.json").exists()
+
+
 def test_worktree_off_last_green(tmp_path):
     repo = setup_repo(tmp_path)
     lg = sha(repo, "refs/greenline/last-green")
