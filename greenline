@@ -2245,6 +2245,34 @@ def cmd_adopt(args) -> int:
             deployed_before = deployed
             if not tip:
                 die(f"no {main} branch to adopt", 2)
+            # Origin ahead of local main (Actions merges landed while local
+            # ungated commits waited for this adopt): pushing the local tip can
+            # never fast-forward, so publish is structurally deadlocked. Adopt
+            # the ORIGIN tip instead — a strict superset of the local one that
+            # already passed Actions, and gating it covers every ungated local
+            # commit too. This is the same reconcile preflight_reconcile
+            # performs once last-green == main; here it must run BEFORE gating
+            # and BEFORE the nothing-to-adopt early return (origin can be ahead
+            # of an otherwise fully reconciled local main).
+            if remote_exists(repo.canonical):
+                origin_ahead = exact_origin_main(repo)
+                if origin_ahead and origin_ahead != tip:
+                    mb = git(
+                        repo.canonical,
+                        "merge-base",
+                        "--is-ancestor",
+                        tip,
+                        origin_ahead,
+                        check=False,
+                    )
+                    if mb.returncode == 0:
+                        with allow_main_updates(repo):
+                            git(repo.canonical, "merge", "--ff-only", origin_ahead)
+                        tip = origin_ahead
+                        say(
+                            f"greenline: origin/{main} is ahead of local {main}; "
+                            f"fast-forwarded to {tip[:8]} and adopting that tip"
+                        )
             if tip == last_green and deployed == tip:
                 say("main already == last-green; nothing to adopt")
                 return 0
@@ -2254,6 +2282,33 @@ def cmd_adopt(args) -> int:
             # hook-blocked by design, which used to leave no way at all to
             # deploy/publish/initialize a freshly set-up repo. Adopt is that
             # path: full check + deploy + publish, no ref mutation needed.
+
+            # Origin ahead of local main (Actions merges landed while local
+            # ungated commits waited for this adopt): pushing the local tip can
+            # never fast-forward, so publish is structurally deadlocked. Adopt
+            # the ORIGIN tip instead — a strict superset of the local one that
+            # already passed Actions, and gating it covers every ungated local
+            # commit too. This is the same reconcile preflight_reconcile
+            # performs once last-green == main; here it must run BEFORE gating.
+            if remote_exists(repo.canonical):
+                origin_ahead = exact_origin_main(repo)
+                if origin_ahead and origin_ahead != tip:
+                    mb = git(
+                        repo.canonical,
+                        "merge-base",
+                        "--is-ancestor",
+                        tip,
+                        origin_ahead,
+                        check=False,
+                    )
+                    if mb.returncode == 0:
+                        with allow_main_updates(repo):
+                            git(repo.canonical, "merge", "--ff-only", origin_ahead)
+                        tip = origin_ahead
+                        say(
+                            f"greenline: origin/{main} is ahead of local {main}; "
+                            f"fast-forwarded to {tip[:8]} and adopting that tip"
+                        )
 
             ensure_gate_worktree(repo)
             journal(
