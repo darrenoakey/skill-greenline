@@ -231,6 +231,11 @@ def canonical_path(path: str | Path) -> Path:
 
 
 def short(path: str | Path, ref: str) -> str:
+    # ref resolves to None when the marker (e.g. last-green on a repo that was
+    # never gate-deployed) does not exist yet; render it like rev-parse
+    # failure ("-") instead of crashing the caller's f-string with a TypeError.
+    if ref is None:
+        return "-"
     p = git(path, "rev-parse", "--short", ref, check=False)
     return p.stdout.strip() if p.returncode == 0 else "-"
 
