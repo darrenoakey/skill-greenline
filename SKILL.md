@@ -35,6 +35,47 @@ from `greenline.toml` (committed at the repo root) and CLI args.
 
 Add `-v`/`--verbose` for git + command output (default is terse — house convention).
 
+## Explicit stopped-baseline bootstrap
+
+`greenline bootstrap BRANCH --repo PATH` is only for a genuinely never-deployed,
+explicitly stopped baseline. It refuses deployed/pending files (even empty),
+previous successful deployment history, incomplete ordinary gates, dirty canonical
+or candidate worktrees, and baseline/origin drift. Do not use `adopt`, edit main,
+or invent an attestation to introduce deployment tooling.
+
+The **committed candidate** must define top-level `check` and `health`, plus:
+
+```toml
+[bootstrap]
+stopped = "./run bootstrap-stopped"
+deploy = "./run deploy --bootstrap-id {bootstrap_id}"
+cleanup = "./run bootstrap-cleanup --bootstrap-id {bootstrap_id}"
+```
+
+`check` validates the actual squashed candidate in the gate worktree. `stopped`
+is a read-only, five-second probe, initially run from that worktree: it must
+prove all baseline services in this release's scope are explicitly stopped and
+refuse unrelated active identities in that scope. Unrelated projects are not
+part of this scope. Deploy and cleanup run at the canonical candidate checkout.
+Deploy must persist the supplied identity before launch; cleanup must stop ONLY
+new processes owned by that exact identity, refuse mismatches, and be idempotent
+when no process was launched. Neither command may launch the old deployment.
+
+Greenline fsyncs `.git/greenline/bootstrap.json` with candidate SHA, prior refs,
+exact commands and random identity before advancing main. Only real deploy,
+health and publish success permits attestation. Failure or interruption runs the
+persisted candidate's cleanup, proves stopped, then restores prior local refs
+**without running the baseline deploy**. Cleanup failure leaves production
+`unknown`, preserves the record and blocks ordinary mutating commands. After
+SIGKILL/restart, run `greenline bootstrap-recover --repo PATH`; never use old
+Greenline revisions, ordinary submit/adopt, or deploy-pending for this record.
+Recovery validates commands against the immutable candidate, not the current
+branch. An interrupted push may already have published the candidate: recovery
+never rewinds origin and leaves the local baseline stopped/unattested with a
+blocking cleanup record retained until origin is safely reconciled.
+
+This mode does not change ordinary submit rollback semantics.
+
 ## Invariants
 
 1. `main` == deployed == green, always.
@@ -166,10 +207,18 @@ cd ~/.claude/skills/greenline
 python3 -m pytest tests/ -x -q
 ```
 
+Run the full `./run check` detached with a durable log and exit-code file, then
+park between observations. Real temporary-repository/process lifecycle tests can
+take several minutes under concurrent runs; do not hold a tool turn or duplicate
+a suite whose verdict is still pending. The runner caps real-process lifecycle
+concurrency at six workers rather than relaxing phase deadlines. `./run check`
+forwards explicit pytest arguments, e.g. `./run check -n 6 tests/` still validates
+the complete suite plus lint. Focused tests remain useful inline.
+
 ## Gotchas & Known Pitfalls
 
 - **Do not run a one-shot `greenline submit` through `launchctl submit`.** On macOS it can relaunch a fast-failing command repeatedly (observed 2026-09-24: five identical lint-failed Mnemnos gates in under a minute). Use a truly one-shot detached process (`subprocess.Popen(..., start_new_session=True)` with a durable log and exit-code file), then sleep until completion. On a failed gate, inspect its journal/log and fix the exact cause before another submission.
-- **Bootstrap deadlock: the first gate run executes `deploy` from the canonical checkout at the OLD main tip (pre-merge), so the deploy can never introduce its own tooling.** If `./run deploy` (or the configured deploy command) does not already work on main, every submit/adopt fails at deploy and rollback also fails. Bootstrap path (observed 2026-09-22, nemotron-voice): implement deploy as a repo `./run` subcommand FIRST, write `.git/greenline/allow-main` with a live PID (the same flag `greenline setup` itself uses), commit the deploy/gate-critical bits on main, delete the flag, then `greenline adopt` to check+deploy+attest the tip in place. Keep `deploy = "./run deploy"` (the setup default). Also: machine-local runtime dirs (e.g. a gitignored `local/` with model weights) don't exist in the gate worktree — resolve them from the canonical checkout via `git rev-parse --git-common-dir` in code, not by symlinking into worktrees (untracked symlinks make `greenline submit` refuse the dirty worktree).
+- **Never bootstrap deployment tooling by writing `allow-main`, editing main or fabricating attestation.** Normal submit advances canonical main to the candidate before deploy, but its failure rollback executes the previous deployment. If that previous command starts an unrelated service, use the explicit stopped-baseline bootstrap above with candidate-owned token cleanup, only when genuinely never deployed and stopped. Ordinary deployed repositories must retain their known-good rollback contract. Machine-local runtime directories do not exist in gate worktrees: resolve them through `git rev-parse --git-common-dir`, not untracked symlinks.
 
 - **`greenline submit` fails "canonical checkout is DIRTY" repeatedly when in-daemon autonomous agents (agentd3 taskdoers) work directly in the canonical checkout.** Cleaning the canonical once is not enough — the worker's next turn re-dirties it (and it may even rebuild+restart a prod color-slot binary from its dirty tree, bouncing production). Fix the SOURCE: list running conversations (`GET /v1/conversations`, filter cwd == canonical repo), interrupt superseded workers (`POST /v1/conversations/{id}/interrupt`), absorb any uncommitted work you want into your branch (copy files / apply diffs, then `git checkout --` + remove untracked in the canonical), and only then resubmit. (agentd3, 2026-07-23.)
 

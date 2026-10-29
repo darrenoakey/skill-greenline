@@ -494,10 +494,12 @@ class GateLock:
     """The original simple exclusive flock, bounded by the release clock."""
 
     def __init__(
-        self, repo: Repo, *, allow_retired: bool = False, fail_if_busy: bool = False
+        self, repo: Repo, *, allow_retired: bool = False, fail_if_busy: bool = False,
+        allow_bootstrap: bool = False,
     ):
         self.repo = repo
         self.allow_retired = allow_retired
+        self.allow_bootstrap = allow_bootstrap
         self.fail_if_busy = fail_if_busy
         self.fh = None
         self.slow_gate: dict | None = None
@@ -520,6 +522,14 @@ class GateLock:
                 self.fh.close()
                 die(f"active gate owns {self.repo.lock_path}; cannot retire now", 2)
             self._wait_with_status()
+        # Admission must recheck after queueing: another holder could have
+        # left a bootstrap cleanup identity while this command waited.
+        if not self.allow_bootstrap:
+            try:
+                require_no_bootstrap(self.repo)
+            except BaseException:
+                self.__exit__(None, None, None)
+                raise
         # A submit may have passed the early guard before a concurrent retire
         # obtained the lock. Recheck while holding it, before reconciliation.
         if not self.allow_retired:
@@ -1782,7 +1792,13 @@ def upsert_marked(path: Path, block: str, begin: str, end: str) -> None:
 # --------------------------------------------------------------------------
 # commands
 # --------------------------------------------------------------------------
+# Setup writes the canonical checkout too; serialize its bootstrap refusal.
 def cmd_setup(args) -> int:
+    with GateLock(load_repo(args.repo)):
+        return setup_locked(args)
+
+
+def setup_locked(args) -> int:
     start = Path(args.repo).resolve() if args.repo else Path.cwd()
     if not is_git_repo(start):
         die(f"{start} is not a git repository", 2)
@@ -2266,6 +2282,287 @@ def cmd_submit(args) -> int:
             lock.clear_status()
 
 
+# --------------------------------------------------------------------------
+# explicit stopped-baseline bootstrap (never executes the previous deploy)
+# --------------------------------------------------------------------------
+def bootstrap_path(repo: Repo) -> Path:
+    return repo.state_dir / "bootstrap.json"
+
+
+# A bootstrap is a distinct transaction: ordinary recovery must never mistake
+# its stopped, never-deployed baseline for a rollback deployment target.
+def require_no_bootstrap(repo: Repo) -> None:
+    if bootstrap_path(repo).exists():
+        die(f"unresolved bootstrap at {bootstrap_path(repo)}; run greenline bootstrap-recover", 2)
+
+
+# Read commands from the committed squash, not the baseline or a mutable branch.
+def bootstrap_commands(repo: Repo, candidate: str) -> dict[str, str]:
+    text = git_out(repo.canonical, "show", f"{candidate}:greenline.toml")
+    config = tomllib.loads(text)
+    if config.get("main_branch", "main") != repo.main_branch:
+        die(f"bootstrap candidate {candidate} changes main_branch", 2)
+    section = config.get("bootstrap", {})
+    commands = {name: config.get(name) for name in ("check", "health")}
+    commands.update({name: section.get(name) for name in ("stopped", "cleanup", "deploy")})
+    if any(not isinstance(value, str) or not value.strip() for value in commands.values()):
+        die(f"candidate {candidate} requires check, health and bootstrap stopped/cleanup/deploy commands", 2)
+    for name in ("cleanup", "deploy"):
+        if "{bootstrap_id}" not in commands[name]:
+            die(f"bootstrap {name} command must bind {{bootstrap_id}} for {candidate}", 2)
+    return commands
+
+
+# Each invocation receives precisely the persisted transaction identity.
+def bootstrap_command(repo: Repo, record: dict, name: str, cwd: Path, log_path: Path) -> None:
+    command = record["commands"][name].replace("{bootstrap_id}", record["bootstrap_id"])
+    cap = HEALTH_HARD_TIMEOUT_SECONDS if name in {"health", "stopped"} else None
+    outcome = run_shell_timed(command, cwd, log_path, cap, f"bootstrap {name} timed out")
+    if outcome.returncode != 0 or outcome.timed_out:
+        raise RuntimeError(
+            f"bootstrap {name} failed rc={outcome.returncode} reason={outcome.timeout_reason}; log: {log_path}"
+        )
+
+
+# Bootstrap cannot infer never-deployed history from a damaged journal.
+def bootstrap_history(repo: Repo) -> list[dict]:
+    try:
+        lines = repo.journal_path.read_text().splitlines() if repo.journal_path.exists() else []
+        entries = [json.loads(line) for line in lines if line.strip()]
+        if any(not isinstance(entry, dict) or not isinstance(entry.get("event"), str) for entry in entries):
+            raise ValueError("journal entry lacks an event identity")
+        return entries
+    except (OSError, ValueError) as exc:
+        die(f"bootstrap refuses unreadable deployment history {repo.journal_path}: {exc}", 2)
+
+
+# Refuse any trace of a deployment, including empty/corrupt attestation files.
+def bootstrap_baseline(repo: Repo) -> tuple[str, str | None]:
+    if repo.deployed_path.exists() or repo.pending_deploy_path.exists():
+        die(f"bootstrap requires no deployed or pending attestation in {repo.state_dir}", 2)
+    history = bootstrap_history(repo)
+    if last_incomplete_gate(repo):
+        die(f"bootstrap refuses an incomplete ordinary gate in {repo.journal_path}", 2)
+    if worktree_is_dirty(repo.canonical) or current_branch(repo.canonical) != repo.main_branch:
+        die(f"bootstrap requires clean canonical on {repo.main_branch}: {repo.canonical}", 2)
+    main = rev(repo.canonical, repo.main_branch)
+    green = rev(repo.canonical, LAST_GREEN_REF)
+    if not main or (green and green != main):
+        die(f"bootstrap requires main == last-green (or no last-green) in {repo.canonical}", 2)
+    successful = {"complete", "pending_deployed", "deployed", "needs_fix_forward", "bootstrap_complete"}
+    if any(entry.get("event") in successful for entry in history):
+        die(f"bootstrap refuses previously deployed journal history in {repo.journal_path}", 2)
+    if remote_exists(repo.canonical):
+        origin = exact_origin_main(repo)
+        if origin and origin != main:
+            die(f"bootstrap requires origin/{repo.main_branch} == baseline {main}; found {origin}", 2)
+    return main, green
+
+
+# Validate the durable cleanup identity before running any command after restart.
+def read_bootstrap(repo: Repo) -> dict:
+    path = bootstrap_path(repo)
+    try:
+        record = json.loads(path.read_text())
+        candidate = record["candidate"]
+        identifier = record["bootstrap_id"]
+        identities = (candidate, record["pre_main"])
+        literal = all(
+            isinstance(identity, str) and len(identity) in (40, 64)
+            and all(character in "0123456789abcdef" for character in identity)
+            and rev(repo.canonical, f"{identity}^{{commit}}") == identity
+            for identity in identities
+        )
+        valid = (
+            literal
+            and record["pre_green"] in (None, record["pre_main"])
+            and git_out(repo.canonical, "rev-list", "--parents", "-n", "1", candidate).split()
+            == [candidate, record["pre_main"]]
+            and record["canonical"] == str(repo.canonical)
+            and record["main_branch"] == repo.main_branch
+            and isinstance(identifier, str) and len(identifier) == 32
+            and all(character in "0123456789abcdef" for character in identifier)
+            and record["commands"] == bootstrap_commands(repo, candidate)
+            and rev(repo.canonical, record["pre_main"]) == record["pre_main"]
+        )
+        if not valid:
+            raise ValueError("bootstrap identity or command mismatch")
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        die(f"cannot safely recover bootstrap record {path}: {exc}", 2)
+    return record
+
+
+# Fsync the ownership record before main can move or deploy can launch a service.
+def persist_bootstrap(repo: Repo, record: dict) -> None:
+    path = bootstrap_path(repo)
+    descriptor, temporary = tempfile.mkstemp(prefix=".bootstrap-", dir=repo.state_dir)
+    try:
+        with os.fdopen(descriptor, "w") as stream:
+            json.dump(record, stream)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory = os.open(repo.state_dir, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary)
+
+
+# Only candidate-owned cleanup may stop the new service. Restore refs AFTER
+# stopped proof; unknown cleanup retains the record and blocks legacy recovery.
+def recover_bootstrap(repo: Repo, log_path: Path) -> None:
+    record = read_bootstrap(repo)
+    candidate = record["candidate"]
+    baseline = record["pre_main"]
+    with recovery_deadline():
+        stopped = False
+        try:
+            if repo.pending_deploy_path.exists():
+                raise RuntimeError(f"unexpected pending deployment at {repo.pending_deploy_path}")
+            if repo.deployed_path.exists() and read_deployed(repo) != candidate:
+                raise RuntimeError(f"unrelated deployed identity at {repo.deployed_path}")
+            if worktree_is_dirty(repo.canonical):
+                raise RuntimeError(f"canonical is dirty: {repo.canonical}")
+            if current_branch(repo.canonical) != repo.main_branch:
+                raise RuntimeError(f"canonical is not on {repo.main_branch}")
+            if rev(repo.canonical, repo.main_branch) not in (baseline, candidate):
+                raise RuntimeError(f"main changed outside bootstrap {record['bootstrap_id']}")
+            if rev(repo.canonical, LAST_GREEN_REF) not in (record["pre_green"], candidate):
+                raise RuntimeError(f"last-green changed outside bootstrap {record['bootstrap_id']}")
+            # Crash may precede ff: candidate cleanup still needs its exact
+            # canonical source, never the baseline's unrelated deploy command.
+            with allow_main_updates(repo):
+                git(repo.canonical, "reset", "--hard", candidate)
+            sync_submodules(repo.canonical)
+            bootstrap_command(repo, record, "cleanup", repo.canonical, log_path)
+            bootstrap_command(repo, record, "stopped", repo.canonical, log_path)
+            stopped = True
+            with allow_main_updates(repo):
+                git(repo.canonical, "reset", "--hard", baseline)
+            sync_submodules(repo.canonical)
+            if record["pre_green"]:
+                set_last_green(repo, record["pre_green"])
+            else:
+                git(repo.canonical, "update-ref", "-d", LAST_GREEN_REF)
+            if read_deployed(repo) == candidate:
+                repo.deployed_path.unlink()
+            # Never rewrite origin even if an interrupted push reached it.
+            origin = exact_origin_main(repo) if remote_exists(repo.canonical) else None
+            if origin and origin != baseline:
+                raise RuntimeError(
+                    f"bootstrap is stopped but origin is {origin}, not baseline {baseline}; "
+                    "cleanup record retained to block unsafe ordinary reconciliation"
+                )
+            journal(repo, "bootstrap_failed", candidate=candidate, pre_main=baseline,
+                    bootstrap_id=record["bootstrap_id"], production="stopped", origin=origin)
+            bootstrap_path(repo).unlink()
+        except BaseException as exc:
+            record["production"] = "stopped" if stopped else "unknown"
+            persist_bootstrap(repo, record)
+            journal(repo, "bootstrap_cleanup_failed", candidate=candidate,
+                    bootstrap_id=record["bootstrap_id"], production=record["production"], reason=str(exc))
+            raise
+
+
+def cmd_bootstrap_recover(args) -> int:
+    repo = load_repo(args.repo)
+    with GateLock(repo, allow_bootstrap=True) as lock:
+        try:
+            lock.set_phase("bootstrap-recovery", "bootstrap")
+            if not bootstrap_path(repo).exists():
+                say("no bootstrap recovery pending")
+                return 0
+            recover_bootstrap(repo, repo.logs_dir / f"{utcnow()}-bootstrap-recovery.log")
+            say("bootstrap stopped; prior local refs restored without old deployment")
+            return 0
+        finally:
+            lock.clear_status()
+
+
+# Keep bootstrap separate from submit: a never-deployed stopped baseline is
+# not a known-good production version and must never reach rollback_submit.
+def cmd_bootstrap(args) -> int:
+    repo = load_repo(args.repo)
+    branch = args.branch
+    if branch in (repo.main_branch, "HEAD") or not rev(repo.canonical, f"refs/heads/{branch}"):
+        die(f"bootstrap requires an existing candidate branch, got {branch}", 2)
+    worktree = worktree_for_branch(repo.canonical, branch)
+    if worktree and worktree_is_dirty(worktree):
+        die(f"bootstrap candidate worktree is dirty: {worktree}", 2)
+    log_path = repo.logs_dir / f"{utcnow()}-bootstrap.log"
+    owned_record = False
+    with GateLock(repo) as lock:
+        try:
+            require_no_bootstrap(repo)
+            baseline, green = bootstrap_baseline(repo)
+            ensure_gate_worktree(repo)
+            lock.set_phase("bootstrap-check", branch)
+            git(repo.gate_path, "merge", "--squash", branch)
+            if not git_out(repo.gate_path, "diff", "--cached", "--name-only"):
+                die(f"bootstrap candidate {branch} has no changes", 2)
+            git(repo.gate_path, "commit", "-m", f"{branch}: stopped-baseline bootstrap\n\nVia: greenline gate")
+            candidate = rev(repo.gate_path, "HEAD")
+            sync_submodules(repo.gate_path)
+            record = {
+                "canonical": str(repo.canonical), "main_branch": repo.main_branch,
+                "candidate": candidate, "pre_main": baseline, "pre_green": green,
+                "bootstrap_id": os.urandom(16).hex(),
+                "commands": bootstrap_commands(repo, candidate), "production": "stopped",
+            }
+            bootstrap_command(repo, record, "check", repo.gate_path, log_path)
+            bootstrap_command(repo, record, "stopped", repo.gate_path, log_path)
+            # Check must not mutate the commit it claims to validate.
+            if worktree_is_dirty(repo.gate_path) or rev(repo.gate_path, "HEAD") != candidate:
+                raise RuntimeError(f"bootstrap check mutated candidate {candidate}")
+            if bootstrap_baseline(repo) != (baseline, green):
+                raise RuntimeError(f"bootstrap baseline changed during candidate check: {baseline}")
+            persist_bootstrap(repo, record)
+            owned_record = True
+            journal(repo, "bootstrap_start", branch=branch, candidate=candidate,
+                    pre_main=baseline, bootstrap_id=record["bootstrap_id"])
+            lock.set_phase("bootstrap-deploy", branch)
+            with allow_main_updates(repo):
+                git(repo.canonical, "merge", "--ff-only", candidate)
+            sync_submodules(repo.canonical)
+            bootstrap_command(repo, record, "deploy", repo.canonical, log_path)
+            bootstrap_command(repo, record, "health", repo.canonical, log_path)
+            if worktree_is_dirty(repo.canonical) or rev(repo.canonical, repo.main_branch) != candidate:
+                raise RuntimeError(f"bootstrap deploy mutated canonical candidate {candidate}")
+            lock.set_phase("bootstrap-publish", branch)
+            if remote_exists(repo.canonical):
+                publish(repo, candidate)
+            release_remaining("bootstrap attestation")
+            write_deployed(repo, candidate)
+            set_last_green(repo, candidate)
+            journal(repo, "bootstrap_complete", branch=branch, merged=candidate,
+                    bootstrap_id=record["bootstrap_id"], production="healthy")
+            bootstrap_path(repo).unlink()
+            say(f"BOOTSTRAP PASSED — checked, deployed and healthy: {candidate}")
+            return 0
+        except BaseException as exc:
+            # SIGTERM, Ctrl-C and ordinary command errors share exactly the
+            # same cleanup. SIGKILL leaves the fsynced identity for recovery.
+            if owned_record and bootstrap_path(repo).exists():
+                try:
+                    recover_bootstrap(repo, log_path)
+                except BaseException as recovery_error:  # noqa: BLE001
+                    warn(f"bootstrap recovery unresolved; blocking record retained: {recovery_error}")
+            journal(repo, "bootstrap_rejected", branch=branch, reason=str(exc))
+            if isinstance(exc, SystemExit):
+                raise
+            if not isinstance(exc, (Exception, KeyboardInterrupt)):
+                raise
+            warn(f"bootstrap failed: {exc}; log: {log_path}")
+            return 1
+        finally:
+            lock.clear_status()
+
+
 def cmd_adopt(args) -> int:
     """Gate the CURRENT main tip in place (commits that reached main outside
     the gate: legacy-workflow sessions, hotfixes). Never resets main."""
@@ -2547,7 +2844,13 @@ def cmd_adopt(args) -> int:
             lock.clear_status()
 
 
+# Worktree removal must not race a bootstrap retaining candidate recovery code.
 def cmd_done(args) -> int:
+    with GateLock(load_repo(args.repo)):
+        return done_locked(args)
+
+
+def done_locked(args) -> int:
     repo = load_repo(args.repo)
     main = repo.main_branch
     start = Path(args.repo).resolve() if args.repo else Path.cwd()
@@ -2707,6 +3010,9 @@ def cmd_status(args) -> int:
             " (`greenline deploy-pending` must recover it)"
         )
 
+    if bootstrap_path(repo).exists():
+        say(f"bootstrap: UNRESOLVED — {bootstrap_path(repo)}; run greenline bootstrap-recover")
+
     entries = journal_entries(repo)
     if entries:
         say("journal  :")
@@ -2781,6 +3087,7 @@ def _doctor_report(repo: Repo) -> bool:
         check("./run present", False, "no run script")
     inc = last_incomplete_gate(repo)
     check("no incomplete gate in journal", inc is None)
+    check("no unresolved bootstrap", not bootstrap_path(repo).exists())
     return ok
 
 
@@ -2828,6 +3135,15 @@ def build_parser() -> argparse.ArgumentParser:
     add_repo(sp)
     sp.set_defaults(func=cmd_submit)
 
+    sp = sub.add_parser("bootstrap", help="gate a never-deployed stopped baseline without legacy rollback")
+    sp.add_argument("branch")
+    add_repo(sp)
+    sp.set_defaults(func=cmd_bootstrap)
+
+    sp = sub.add_parser("bootstrap-recover", help="stop token-owned bootstrap service and restore prior refs")
+    add_repo(sp)
+    sp.set_defaults(func=cmd_bootstrap_recover)
+
     sp = sub.add_parser(
         "adopt", help="gate the current main tip in place (out-of-gate commits)"
     )
@@ -2867,7 +3183,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     VERBOSE = args.verbose
-    release_command = args.cmd in {"submit", "adopt", "deploy-pending"}
+    release_command = args.cmd in {"submit", "adopt", "deploy-pending", "bootstrap", "bootstrap-recover"}
     previous_sigterm = None
     if release_command:
         ACTIVE_RELEASE_DEADLINE = ReleaseDeadline(
@@ -2886,7 +3202,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd not in {"retire", "status"} and not (
             args.cmd == "doctor" and not args.fix
         ):
-            require_active(load_repo(args.repo))
+            target = load_repo(args.repo)
+            require_active(target)
+            if args.cmd != "bootstrap-recover":
+                require_no_bootstrap(target)
         return args.func(args)
     except ReleaseDeadlineExceeded as exc:
         warn(f"RELEASE DEADLINE FAILED — {exc}")
