@@ -43,6 +43,19 @@ previous successful deployment history, incomplete ordinary gates, dirty canonic
 or candidate worktrees, and baseline/origin drift. Do not use `adopt`, edit main,
 or invent an attestation to introduce deployment tooling.
 
+For an **already attested but deliberately stopped** release whose old deployment
+must not be restarted, explicitly opt into maintenance:
+
+```bash
+greenline bootstrap BRANCH --stopped-baseline EXACT_40_CHARACTER_DEPLOYED_SHA --repo PATH
+```
+
+Maintenance requires clean `main == last-green == deployed ==` that exact literal
+SHA, matching successful deployment history, no pending or unknown release, and
+origin at that same baseline. A missing, empty, corrupt, abbreviated or mismatched
+attestation is not maintenance authorization. The default command still refuses
+all prior attestations and successful deployment history.
+
 The **committed candidate** must define top-level `check` and `health`, plus:
 
 ```toml
@@ -53,7 +66,8 @@ cleanup = "./run bootstrap-cleanup --bootstrap-id {bootstrap_id}"
 ```
 
 `check` validates the actual squashed candidate in the gate worktree. `stopped`
-is a read-only, five-second probe, initially run from that worktree: it must
+is a read-only, five-second probe, run from that worktree after acquiring the lock
+and again after check before advancing main. It must
 prove all baseline services in this release's scope are explicitly stopped and
 refuse unrelated active identities in that scope. Unrelated projects are not
 part of this scope. Deploy and cleanup run at the canonical candidate checkout.
@@ -62,7 +76,8 @@ new processes owned by that exact identity, refuse mismatches, and be idempotent
 when no process was launched. Neither command may launch the old deployment.
 
 Greenline fsyncs `.git/greenline/bootstrap.json` with candidate SHA, prior refs,
-exact commands and random identity before advancing main. Only real deploy,
+versioned mode, exact stopped baseline, prior attestation, exact commands and random
+identity before advancing main. Only real deploy,
 health and publish success permits attestation. Failure or interruption runs the
 persisted candidate's cleanup, proves stopped, then restores prior local refs
 **without running the baseline deploy**. Cleanup failure leaves production
@@ -71,10 +86,26 @@ SIGKILL/restart, run `greenline bootstrap-recover --repo PATH`; never use old
 Greenline revisions, ordinary submit/adopt, or deploy-pending for this record.
 Recovery validates commands against the immutable candidate, not the current
 branch. An interrupted push may already have published the candidate: recovery
-never rewinds origin and leaves the local baseline stopped/unattested with a
-blocking cleanup record retained until origin is safely reconciled.
+never rewinds origin and leaves the local baseline stopped with a blocking cleanup
+record retained until origin is safely reconciled.
 
-This mode does not change ordinary submit rollback semantics.
+Maintenance failure preserves the legitimate prior attestation as history after
+cleanup and stopped proof. The journal records production `stopped`, not restored
+healthy. Ordinary mutating commands refuse that stopped state, including commands
+that queued before cleanup; retry through the explicit exact-baseline maintenance
+command. Success replaces the attestation only after real candidate check, deploy,
+health and publish. Recovery refuses malformed or mismatched mode/baseline metadata.
+Older first-deploy recovery records remain supported without relaxing their guards.
+
+This mode never invokes the old deploy and does not change ordinary submit rollback
+semantics for healthy releases. Run the CLI from its reviewed worktree when the
+canonical Greenline checkout has unrelated changes; do not install or adopt it.
+
+The lifecycle suites launch real git, CLI and disposable HTTP processes. Do not
+run overlapping copies during independent review. On a busy host, `./run check -n 2`
+runs the entire suite with lower process concurrency and unchanged deadlines.
+Run long checks detached, record their exit code, and park the conversation while
+they execute rather than holding a turn waiting for agents or test processes.
 
 ## Invariants
 
@@ -218,7 +249,7 @@ the complete suite plus lint. Focused tests remain useful inline.
 ## Gotchas & Known Pitfalls
 
 - **Do not run a one-shot `greenline submit` through `launchctl submit`.** On macOS it can relaunch a fast-failing command repeatedly (observed 2026-09-24: five identical lint-failed Mnemnos gates in under a minute). Use a truly one-shot detached process (`subprocess.Popen(..., start_new_session=True)` with a durable log and exit-code file), then sleep until completion. On a failed gate, inspect its journal/log and fix the exact cause before another submission.
-- **Never bootstrap deployment tooling by writing `allow-main`, editing main or fabricating attestation.** Normal submit advances canonical main to the candidate before deploy, but its failure rollback executes the previous deployment. If that previous command starts an unrelated service, use the explicit stopped-baseline bootstrap above with candidate-owned token cleanup, only when genuinely never deployed and stopped. Ordinary deployed repositories must retain their known-good rollback contract. Machine-local runtime directories do not exist in gate worktrees: resolve them through `git rev-parse --git-common-dir`, not untracked symlinks.
+- **Never bootstrap deployment tooling by writing `allow-main`, editing main or fabricating attestation.** Normal submit advances canonical main to the candidate before deploy, but its failure rollback executes the previous deployment. If that previous command must not be restarted, use explicit stopped-baseline bootstrap above with candidate-owned token cleanup: default mode is only for genuinely never-deployed stopped baselines; maintenance requires `--stopped-baseline` with the exact already-attested SHA and stopped proof. Healthy deployed repositories retain their ordinary known-good rollback contract. Machine-local runtime directories do not exist in gate worktrees: resolve them through `git rev-parse --git-common-dir`, not untracked symlinks.
 
 - **`greenline submit` fails "canonical checkout is DIRTY" repeatedly when in-daemon autonomous agents (agentd3 taskdoers) work directly in the canonical checkout.** Cleaning the canonical once is not enough — the worker's next turn re-dirties it (and it may even rebuild+restart a prod color-slot binary from its dirty tree, bouncing production). Fix the SOURCE: list running conversations (`GET /v1/conversations`, filter cwd == canonical repo), interrupt superseded workers (`POST /v1/conversations/{id}/interrupt`), absorb any uncommitted work you want into your branch (copy files / apply diffs, then `git checkout --` + remove untracked in the canonical), and only then resubmit. (agentd3, 2026-07-23.)
 

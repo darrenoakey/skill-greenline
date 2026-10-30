@@ -92,6 +92,13 @@ def test_shared_test_helper_module_reselects_its_importers():
     assert "tests/test_greenline_speedup.py" in selected
 
 
+def test_bootstrap_lifecycle_helper_reselects_maintenance_tests():
+    mod = load_selector()
+    assert mod.select(["tests/test_bootstrap.py"]) == [
+        "tests/test_bootstrap.py", "tests/test_stopped_baseline.py",
+    ]
+
+
 def test_leaf_test_change_selects_only_itself():
     mod = load_selector()
     assert mod.select(["tests/test_waiter.py"]) == ["tests/test_waiter.py"]

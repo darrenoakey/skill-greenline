@@ -36,6 +36,7 @@ OWNED_IMPACT = {
 
 # Test modules other test modules import: changing one re-tests its dependents.
 TEST_HUBS = {
+    "tests/test_bootstrap.py": ("tests/test_bootstrap.py", "tests/test_stopped_baseline.py"),
     "tests/test_greenline.py": (
         "tests/test_greenline.py",
         "tests/test_deadline_cleanup.py",

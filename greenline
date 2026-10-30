@@ -495,11 +495,12 @@ class GateLock:
 
     def __init__(
         self, repo: Repo, *, allow_retired: bool = False, fail_if_busy: bool = False,
-        allow_bootstrap: bool = False,
+        allow_bootstrap: bool = False, allow_stopped_baseline: bool = False,
     ):
         self.repo = repo
         self.allow_retired = allow_retired
         self.allow_bootstrap = allow_bootstrap
+        self.allow_stopped_baseline = allow_stopped_baseline
         self.fail_if_busy = fail_if_busy
         self.fh = None
         self.slow_gate: dict | None = None
@@ -526,7 +527,7 @@ class GateLock:
         # left a bootstrap cleanup identity while this command waited.
         if not self.allow_bootstrap:
             try:
-                require_no_bootstrap(self.repo)
+                require_no_bootstrap(self.repo, allow_stopped_baseline=self.allow_stopped_baseline)
             except BaseException:
                 self.__exit__(None, None, None)
                 raise
@@ -2289,11 +2290,27 @@ def bootstrap_path(repo: Repo) -> Path:
     return repo.state_dir / "bootstrap.json"
 
 
+# Historical attestation does not authorize restarting a deliberately stopped
+# release. Keep this state in the existing durable journal, not another marker.
+def stopped_maintenance(repo: Repo) -> dict | None:
+    for entry in reversed(bootstrap_history(repo)):
+        if entry["event"] in {"complete", "pending_deployed", "bootstrap_complete"}:
+            break
+        if (entry["event"] == "bootstrap_failed" and entry.get("mode") == "stopped-baseline"
+                and entry.get("production") == "stopped"):
+            return entry
+    return None
+
+
 # A bootstrap is a distinct transaction: ordinary recovery must never mistake
-# its stopped, never-deployed baseline for a rollback deployment target.
-def require_no_bootstrap(repo: Repo) -> None:
+# its stopped baseline for a healthy rollback deployment target.
+def require_no_bootstrap(repo: Repo, *, allow_stopped_baseline: bool = False) -> None:
     if bootstrap_path(repo).exists():
         die(f"unresolved bootstrap at {bootstrap_path(repo)}; run greenline bootstrap-recover", 2)
+    stopped = None if allow_stopped_baseline else stopped_maintenance(repo)
+    if stopped:
+        die(f"production is STOPPED at historical baseline {stopped.get('pre_main')}; "
+            "use bootstrap --stopped-baseline with the exact attested SHA", 2)
 
 
 # Read commands from the committed squash, not the baseline or a mutable branch.
@@ -2336,9 +2353,14 @@ def bootstrap_history(repo: Repo) -> list[dict]:
         die(f"bootstrap refuses unreadable deployment history {repo.journal_path}: {exc}", 2)
 
 
-# Refuse any trace of a deployment, including empty/corrupt attestation files.
-def bootstrap_baseline(repo: Repo) -> tuple[str, str | None]:
-    if repo.deployed_path.exists() or repo.pending_deploy_path.exists():
+# First deploy refuses every attestation; maintenance requires an exact,
+# already-attested stopped baseline, never an inferred rollback target.
+def bootstrap_baseline(repo: Repo, stopped_baseline: str | None = None) -> tuple[str, str | None]:
+    if stopped_baseline is not None and (
+        len(stopped_baseline) != 40 or any(character not in "0123456789abcdef" for character in stopped_baseline)
+    ):
+        die(f"stopped-baseline requires an exact 40-character deployed SHA, got {stopped_baseline!r}", 2)
+    if repo.pending_deploy_path.exists() or (stopped_baseline is None and repo.deployed_path.exists()):
         die(f"bootstrap requires no deployed or pending attestation in {repo.state_dir}", 2)
     history = bootstrap_history(repo)
     if last_incomplete_gate(repo):
@@ -2350,8 +2372,36 @@ def bootstrap_baseline(repo: Repo) -> tuple[str, str | None]:
     if not main or (green and green != main):
         die(f"bootstrap requires main == last-green (or no last-green) in {repo.canonical}", 2)
     successful = {"complete", "pending_deployed", "deployed", "needs_fix_forward", "bootstrap_complete"}
-    if any(entry.get("event") in successful for entry in history):
-        die(f"bootstrap refuses previously deployed journal history in {repo.journal_path}", 2)
+    if stopped_baseline is None:
+        if any(entry.get("event") in successful for entry in history):
+            die(f"bootstrap refuses previously deployed journal history in {repo.journal_path}", 2)
+    else:
+        try:
+            attestation = repo.deployed_path.read_text()
+        except OSError as exc:
+            die(f"stopped-baseline requires a readable prior attestation: {exc}", 2)
+        if main != stopped_baseline or green != stopped_baseline or attestation != stopped_baseline + "\n":
+            die(f"stopped-baseline requires main == last-green == deployed == {stopped_baseline}", 2)
+        attested = [index for index, entry in enumerate(history)
+                    if entry["event"] in {"complete", "pending_deployed", "bootstrap_complete"}
+                    and entry.get("merged", entry.get("tip")) == stopped_baseline]
+        if not attested:
+            die(f"stopped-baseline lacks successful deployment history for {stopped_baseline}", 2)
+        unknown = False
+        for entry in history[attested[-1] + 1:]:
+            if (entry["event"] == "bootstrap_failed" and entry.get("production") == "stopped"
+                    and entry.get("pre_main") == stopped_baseline):
+                unknown = False  # Exact candidate cleanup and stopped proof resolved the uncertainty.
+            elif (entry["event"] in {"rollback_failed", "needs_fix_forward", "bootstrap_cleanup_failed",
+                                    "error", "pending_deploy_failed"}
+                  or "rollback_error" in entry
+                  or ("production" in entry and entry["production"] not in {"healthy", "stopped"})
+                  or (entry.get("bootstrap") is True and entry.get("stage") == "deploy")
+                  or ("reconciliation" in entry
+                      and entry["reconciliation"] not in {"pre_release_restored", "candidate_published"})):
+                unknown = True
+        if unknown:
+            die(f"stopped-baseline refuses unknown release state after {stopped_baseline}", 2)
     if remote_exists(repo.canonical):
         origin = exact_origin_main(repo)
         if origin and origin != main:
@@ -2366,6 +2416,29 @@ def read_bootstrap(repo: Repo) -> dict:
         record = json.loads(path.read_text())
         candidate = record["candidate"]
         identifier = record["bootstrap_id"]
+        # Old first-deploy transactions remain recoverable, but partial or
+        # unrecognized mode metadata must never silently become first-deploy.
+        metadata = {"version", "mode", "stopped_baseline", "pre_deployed"}
+        if not metadata.intersection(record):
+            record.update(version=2, mode="first-deploy", stopped_baseline=None, pre_deployed=None)
+        if record["version"] != 2 or type(record["version"]) is not int:
+            raise ValueError("unknown bootstrap record version")
+        maintenance = record["mode"] == "stopped-baseline"
+        if record["mode"] not in {"first-deploy", "stopped-baseline"}:
+            raise ValueError("unknown bootstrap mode")
+        expected_prior = record["pre_main"] if maintenance else None
+        if record["stopped_baseline"] != expected_prior or record["pre_deployed"] != expected_prior:
+            raise ValueError("bootstrap baseline or prior attestation mismatch")
+        if maintenance and (record["pre_green"] != expected_prior or len(expected_prior) != 40):
+            raise ValueError("stopped-baseline requires exact main, green and deployed identities")
+        history = bootstrap_history(repo)
+        if not maintenance and any(
+            entry["event"] in {"complete", "pending_deployed", "deployed", "needs_fix_forward", "bootstrap_complete"}
+            and not (entry["event"] == "bootstrap_complete" and entry.get("merged") == candidate
+                     and entry.get("bootstrap_id") == identifier)
+            for entry in history
+        ):
+            raise ValueError("first-deploy recovery refuses prior deployment history")
         identities = (candidate, record["pre_main"])
         literal = all(
             isinstance(identity, str) and len(identity) in (40, 64)
@@ -2384,6 +2457,11 @@ def read_bootstrap(repo: Repo) -> dict:
             and all(character in "0123456789abcdef" for character in identifier)
             and record["commands"] == bootstrap_commands(repo, candidate)
             and rev(repo.canonical, record["pre_main"]) == record["pre_main"]
+            and (not maintenance or any(
+                entry["event"] in {"complete", "pending_deployed", "bootstrap_complete"}
+                and entry.get("merged", entry.get("tip")) == expected_prior
+                for entry in history
+            ))
         )
         if not valid:
             raise ValueError("bootstrap identity or command mismatch")
@@ -2424,8 +2502,13 @@ def recover_bootstrap(repo: Repo, log_path: Path) -> None:
         try:
             if repo.pending_deploy_path.exists():
                 raise RuntimeError(f"unexpected pending deployment at {repo.pending_deploy_path}")
-            if repo.deployed_path.exists() and read_deployed(repo) != candidate:
-                raise RuntimeError(f"unrelated deployed identity at {repo.deployed_path}")
+            prior = record["pre_deployed"]
+            allowed = {identity + "\n" for identity in (candidate, prior) if identity is not None}
+            if repo.deployed_path.exists():
+                if repo.deployed_path.read_text() not in allowed:
+                    raise RuntimeError(f"unrelated deployed identity at {repo.deployed_path}")
+            elif prior is not None:
+                raise RuntimeError(f"missing prior attestation at {repo.deployed_path}")
             if worktree_is_dirty(repo.canonical):
                 raise RuntimeError(f"canonical is dirty: {repo.canonical}")
             if current_branch(repo.canonical) != repo.main_branch:
@@ -2449,7 +2532,12 @@ def recover_bootstrap(repo: Repo, log_path: Path) -> None:
                 set_last_green(repo, record["pre_green"])
             else:
                 git(repo.canonical, "update-ref", "-d", LAST_GREEN_REF)
-            if read_deployed(repo) == candidate:
+            if prior is not None:
+                # Historical attestation is not a claim that production was
+                # restarted: the terminal event explicitly records STOPPED.
+                if read_deployed(repo) != prior:
+                    write_deployed(repo, prior)
+            elif repo.deployed_path.exists():
                 repo.deployed_path.unlink()
             # Never rewrite origin even if an interrupted push reached it.
             origin = exact_origin_main(repo) if remote_exists(repo.canonical) else None
@@ -2459,7 +2547,8 @@ def recover_bootstrap(repo: Repo, log_path: Path) -> None:
                     "cleanup record retained to block unsafe ordinary reconciliation"
                 )
             journal(repo, "bootstrap_failed", candidate=candidate, pre_main=baseline,
-                    bootstrap_id=record["bootstrap_id"], production="stopped", origin=origin)
+                    bootstrap_id=record["bootstrap_id"], production="stopped", origin=origin,
+                    mode=record["mode"], stopped_baseline=record["stopped_baseline"], pre_deployed=prior)
             bootstrap_path(repo).unlink()
         except BaseException as exc:
             record["production"] = "stopped" if stopped else "unknown"
@@ -2496,10 +2585,10 @@ def cmd_bootstrap(args) -> int:
         die(f"bootstrap candidate worktree is dirty: {worktree}", 2)
     log_path = repo.logs_dir / f"{utcnow()}-bootstrap.log"
     owned_record = False
-    with GateLock(repo) as lock:
+    with GateLock(repo, allow_stopped_baseline=args.stopped_baseline is not None) as lock:
         try:
-            require_no_bootstrap(repo)
-            baseline, green = bootstrap_baseline(repo)
+            require_no_bootstrap(repo, allow_stopped_baseline=args.stopped_baseline is not None)
+            baseline, green = bootstrap_baseline(repo, args.stopped_baseline)
             ensure_gate_worktree(repo)
             lock.set_phase("bootstrap-check", branch)
             git(repo.gate_path, "merge", "--squash", branch)
@@ -2509,22 +2598,28 @@ def cmd_bootstrap(args) -> int:
             candidate = rev(repo.gate_path, "HEAD")
             sync_submodules(repo.gate_path)
             record = {
+                "version": 2, "mode": "stopped-baseline" if args.stopped_baseline else "first-deploy",
+                "stopped_baseline": args.stopped_baseline, "pre_deployed": args.stopped_baseline,
                 "canonical": str(repo.canonical), "main_branch": repo.main_branch,
                 "candidate": candidate, "pre_main": baseline, "pre_green": green,
                 "bootstrap_id": os.urandom(16).hex(),
                 "commands": bootstrap_commands(repo, candidate), "production": "stopped",
             }
+            # Prove stopped after taking the lock, and again immediately
+            # before advancing main: check may take time or change live state.
+            bootstrap_command(repo, record, "stopped", repo.gate_path, log_path)
             bootstrap_command(repo, record, "check", repo.gate_path, log_path)
             bootstrap_command(repo, record, "stopped", repo.gate_path, log_path)
             # Check must not mutate the commit it claims to validate.
             if worktree_is_dirty(repo.gate_path) or rev(repo.gate_path, "HEAD") != candidate:
                 raise RuntimeError(f"bootstrap check mutated candidate {candidate}")
-            if bootstrap_baseline(repo) != (baseline, green):
+            if bootstrap_baseline(repo, args.stopped_baseline) != (baseline, green):
                 raise RuntimeError(f"bootstrap baseline changed during candidate check: {baseline}")
             persist_bootstrap(repo, record)
             owned_record = True
             journal(repo, "bootstrap_start", branch=branch, candidate=candidate,
-                    pre_main=baseline, bootstrap_id=record["bootstrap_id"])
+                    pre_main=baseline, bootstrap_id=record["bootstrap_id"],
+                    mode=record["mode"], stopped_baseline=record["stopped_baseline"])
             lock.set_phase("bootstrap-deploy", branch)
             with allow_main_updates(repo):
                 git(repo.canonical, "merge", "--ff-only", candidate)
@@ -2540,7 +2635,8 @@ def cmd_bootstrap(args) -> int:
             write_deployed(repo, candidate)
             set_last_green(repo, candidate)
             journal(repo, "bootstrap_complete", branch=branch, merged=candidate,
-                    bootstrap_id=record["bootstrap_id"], production="healthy")
+                    bootstrap_id=record["bootstrap_id"], production="healthy",
+                    mode=record["mode"], stopped_baseline=record["stopped_baseline"])
             bootstrap_path(repo).unlink()
             say(f"BOOTSTRAP PASSED — checked, deployed and healthy: {candidate}")
             return 0
@@ -2995,7 +3091,11 @@ def cmd_status(args) -> int:
         o = rev(canon, f"origin/{main}")
         origin_s = short(canon, o) if o else "-"
     pending = read_pending_deploy(repo)
-    if pending:
+    if bootstrap_path(repo).exists():
+        verdict = "BOOTSTRAP UNRESOLVED"
+    elif stopped_maintenance(repo):
+        verdict = "PRODUCTION STOPPED; attestation historical"
+    elif pending:
         verdict = "DEPLOY UNATTESTED"
     elif main_sha == lg == dep_s:
         verdict = "OK"
@@ -3088,6 +3188,7 @@ def _doctor_report(repo: Repo) -> bool:
     inc = last_incomplete_gate(repo)
     check("no incomplete gate in journal", inc is None)
     check("no unresolved bootstrap", not bootstrap_path(repo).exists())
+    check("production not deliberately stopped", stopped_maintenance(repo) is None)
     return ok
 
 
@@ -3135,8 +3236,10 @@ def build_parser() -> argparse.ArgumentParser:
     add_repo(sp)
     sp.set_defaults(func=cmd_submit)
 
-    sp = sub.add_parser("bootstrap", help="gate a never-deployed stopped baseline without legacy rollback")
+    sp = sub.add_parser("bootstrap", help="gate a stopped baseline without legacy rollback")
     sp.add_argument("branch")
+    sp.add_argument("--stopped-baseline", metavar="DEPLOYED_SHA",
+                    help="explicit maintenance opt-in: exact 40-character main == last-green == deployed SHA")
     add_repo(sp)
     sp.set_defaults(func=cmd_bootstrap)
 
@@ -3205,7 +3308,9 @@ def main(argv: list[str] | None = None) -> int:
             target = load_repo(args.repo)
             require_active(target)
             if args.cmd != "bootstrap-recover":
-                require_no_bootstrap(target)
+                require_no_bootstrap(target, allow_stopped_baseline=(
+                    args.cmd == "bootstrap" and args.stopped_baseline is not None
+                ))
         return args.func(args)
     except ReleaseDeadlineExceeded as exc:
         warn(f"RELEASE DEADLINE FAILED — {exc}")
