@@ -166,6 +166,19 @@ cd ~/.claude/skills/greenline
 python3 -m pytest tests/ -x -q
 ```
 
+## Checking CI and releases
+
+Use `gh-ci-skim` (`~/bin/gh-ci-skim`) instead of repeated raw `gh run view`, `gh run list`,
+`gh pr view` or `gh release list` calls. Each call returns one VERDICT:
+
+- `gh-ci-skim -R OWNER/REPO pr N`: PR state and the latest run per workflow for the head sha.
+- `gh-ci-skim -R OWNER/REPO run RUN_ID`: jobs, failed steps, matched `##[error]` lines and a log
+  tail. The full cleaned log is saved to `~/.cache/gh-ci-skim/RUN_ID.log`.
+- `gh-ci-skim -R OWNER/REPO runs --workflow FILE` and `gh-ci-skim -R OWNER/REPO-RELEASES releases`.
+
+Exit codes: 0 success, 1 failure, 3 pending, 2 error. It is a snapshot and never waits: between
+checks use the sleep tool, then call it again.
+
 ## Gotchas & Known Pitfalls
 
 - **Do not run a one-shot `greenline submit` through `launchctl submit`.** On macOS it can relaunch a fast-failing command repeatedly (observed 2026-09-24: five identical lint-failed Mnemnos gates in under a minute). Use a truly one-shot detached process (`subprocess.Popen(..., start_new_session=True)` with a durable log and exit-code file), then sleep until completion. On a failed gate, inspect its journal/log and fix the exact cause before another submission.
