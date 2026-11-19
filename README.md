@@ -39,7 +39,7 @@ This writes `greenline.toml`, creates the gate worktree, installs git hooks that
 |---|---|
 | `greenline setup` | Set up a repo for greenline. Installs hooks, config, and state. |
 | `greenline worktree NAME` | Create a new worktree and branch `gl/NAME` off the last green commit. |
-| `greenline submit [BRANCH]` | Run a branch through queue + check + deploy + publish; target 180 seconds, hard end-to-end ceiling 600 seconds. |
+| `greenline submit [--graceful-only] [BRANCH]` | Run a branch through queue + check + deploy + publish; target 180 seconds, hard end-to-end ceiling 600 seconds. |
 | `greenline adopt` | Gate the current `main` tip in place — for commits that arrived outside the gate. |
 | `greenline done` | Remove a merged worktree and delete its branch. |
 | `greenline status` | Show lock state, SHA drift, last journal entries, and gate health. |
@@ -163,6 +163,29 @@ greenline calls two scripts in your repo:
 - **`./run health`** *(optional)* — a probe with no side effects, under a 5-second hard timeout; a probe that does not answer in time is unhealthy. If absent, greenline re-runs `deploy` as the health probe (under the deploy cap).
 
 The complete release normally averages and targets 180 seconds, with one 600-second loaded-machine worst-case hard deadline from invocation through queue, reconcile, check, deploy, publish, and attestation. At five minutes, immediately investigate the active stage and process tree. At ten minutes, terminate and reap the attempt, then fix its cause before submitting again—never wait for load, rearm a TTL watcher, or retry unchanged. Avoid narrower inner timeouts that can falsely fail useful work while aggregate time remains. Expiry is a terminal release failure; rollback/recovery then runs under a separate bounded clock and is reported as recovery, never success. Successful releases durably journal and print queue/check/deploy/publish/total timings, and total time over 180 seconds automatically triggers a detached speed-up investigation after unlock; acceptance is reported only after the investigation tool proves it.
+
+### Opt-in graceful releases
+
+`greenline submit --graceful-only` requires an already reconciled baseline and a
+committed regular executable at `tools/graceful-release`. Greenline checks the
+candidate normally, then runs the exact tested driver bytes from private Git
+state, with the canonical checkout as cwd and arguments
+`deploy|rollback TARGET_SHA ABSOLUTE_STATE_DIR`. The target is the tested squash
+commit on deploy and the original main SHA on rollback. Do not rely on the
+executable's own location to find repository files.
+
+The driver must attest health, bound its own waits, and finish its work before
+exiting. It holds an inherited transaction lease, which it must not close or
+pass to detached services. Use the state directory to save the baseline before
+changing live state. Rollback must be retryable, including if deploy had not
+started. Greenline removes the directory after release or rollback succeeds.
+
+The coordinator deadline still fails the submission, but it **does not signal**
+the graceful driver. The journal and state stay available; `greenline doctor
+--fix` retries recovery after the driver has exited. Recovery never runs the
+legacy deploy or health command. Use a graceful-aware Greenline executable for
+all release or recovery commands on that repo: older binaries cannot honor
+this journal protocol.
 
 ## Key rules for agents working in greenline repos
 

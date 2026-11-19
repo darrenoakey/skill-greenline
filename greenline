@@ -13,12 +13,14 @@ import argparse
 import codecs
 import contextlib
 import fcntl
+import hashlib
 import json
 import locale
 import os
 import selectors
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -68,6 +70,9 @@ PROCESS_GROUP_TERM_GRACE_SECONDS = 2
 PROCESS_GROUP_KILL_GRACE_SECONDS = 2
 PROCESS_PIPE_DRAIN_SECONDS = 2
 
+GRACEFUL_DRIVER_RELPATH = Path("tools/graceful-release")
+GRACEFUL_ATTEMPT_PREFIX = "graceful-"
+
 VERBOSE = False
 ACTIVE_RELEASE_DEADLINE: "ReleaseDeadline | None" = None
 
@@ -78,6 +83,14 @@ class ReleaseDeadlineExceeded(RuntimeError):
 
 class ReleaseCancelled(RuntimeError):
     pass
+
+
+class GracefulTransactionError(RuntimeError):
+    pass
+
+
+class GracefulDriverRunning(GracefulTransactionError):
+    """The coordinator stopped waiting; the graceful driver still owns recovery."""
 
 
 @dataclass
@@ -177,11 +190,11 @@ def utcstamp() -> str:
 # git plumbing — always explicit -C, never rely on cwd
 # --------------------------------------------------------------------------
 def git(
-    path: str | Path, *args: str, check: bool = True
+    path: str | Path, *args: str, check: bool = True, text: bool = True
 ) -> subprocess.CompletedProcess:
     cmd = ["git", "-c", "maintenance.auto=false", "-C", str(path), *args]
     vsay("$ " + " ".join(cmd))
-    proc = run_argv(cmd, "git")
+    proc = run_argv(cmd, "git", text=text)
     if check and proc.returncode != 0:
         raise GitError(cmd, proc)
     return proc
@@ -649,11 +662,14 @@ def write_json(path: Path, data: dict) -> None:
     tmp.replace(path)
 
 
-def journal(repo: Repo, event: str, **fields) -> None:
+def journal(repo: Repo, event: str, *, durable: bool = False, **fields) -> None:
     repo.ensure_state()
     entry = {"event": event, "ts": utcstamp(), **fields}
     with repo.journal_path.open("a") as fh:
         fh.write(json.dumps(entry) + "\n")
+        if durable:
+            fh.flush()
+            os.fsync(fh.fileno())
 
 
 def journal_entries(repo: Repo) -> list[dict]:
@@ -691,27 +707,39 @@ def last_incomplete_gate(repo: Repo) -> dict | None:
             start = e
             start["_phase_events"] = []
         elif start is not None:
-            if e.get("event") in TERMINAL_EVENTS:
+            event = e.get("event")
+            if event == "graceful_prepared":
+                start["graceful"] = e["graceful"]
+            # Graceful failures are not terminal until recovery actually settles.
+            if event in TERMINAL_EVENTS and (
+                not start.get("graceful") or e.get("graceful_settled")
+            ):
                 start = None
             else:
-                start["_phase_events"].append(e.get("event"))
+                start["_phase_events"].append(event)
                 # later phase events carry the candidate SHA; fold it up
                 if e.get("candidate") and not start.get("candidate"):
                     start["candidate"] = e["candidate"]
     return start
 
 
+def require_no_graceful_recovery(repo: Repo) -> None:
+    inc = last_incomplete_gate(repo)
+    if inc and inc.get("graceful"):
+        raise GracefulTransactionError("legacy deploy or probe blocked by incomplete graceful transaction")
+
+
 # --------------------------------------------------------------------------
 # command runner (tee to log)
 # --------------------------------------------------------------------------
-def run_argv(cmd: list[str], stage: str) -> subprocess.CompletedProcess:
+def run_argv(cmd: list[str], stage: str, *, text: bool = True) -> subprocess.CompletedProcess:
     """Run argv under the active release deadline and reap its process group."""
     release_remaining(stage)
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
+        text=text,
         start_new_session=True,
     )
     try:
@@ -911,6 +939,7 @@ def run_gate_deploy(repo: Repo, log_path: Path) -> CommandOutcome:
 
     Outside either workflow, retain the historical standalone deploy bound.
     """
+    require_no_graceful_recovery(repo)
     return run_shell_timed(
         repo.deploy_cmd,
         repo.canonical,
@@ -1137,6 +1166,7 @@ def health_probe(repo: Repo, log_path: Path) -> bool:
     wedge every submission behind it. With no health command configured the
     probe IS the deploy, so it gets the deploy cap instead of the 5-second one.
     """
+    require_no_graceful_recovery(repo)
     cmd = repo.health_cmd
     timeout = HEALTH_HARD_TIMEOUT_SECONDS
     reason = HEALTH_TIMEOUT_REASON
@@ -1152,9 +1182,161 @@ def health_probe(repo: Repo, log_path: Path) -> bool:
 
 
 # --------------------------------------------------------------------------
+# explicit graceful transaction
+# --------------------------------------------------------------------------
+def graceful_driver_blob(cwd: Path, commit: str) -> bytes:
+    path = GRACEFUL_DRIVER_RELPATH.as_posix()
+    entry = git_out(cwd, "ls-tree", commit, "--", path).split()
+    if len(entry) != 4 or entry[:2] != ["100755", "blob"] or entry[3] != path:
+        die(f"--graceful-only requires a committed executable regular file at {path}", 2)
+    return git(cwd, "cat-file", "blob", entry[2], text=False).stdout
+
+
+def verify_graceful_driver(path: Path, pinned: bytes) -> None:
+    if (
+        path.parent.is_symlink()
+        or path.is_symlink()
+        or not path.is_file()
+        or not path.stat().st_mode & stat.S_IXUSR
+        or path.read_bytes() != pinned
+    ):
+        die(f"graceful driver does not match its committed executable: {path}", 2)
+
+
+def prepare_graceful(repo: Repo, candidate: str, pinned: bytes) -> Path:
+    attempt = Path(tempfile.mkdtemp(prefix=GRACEFUL_ATTEMPT_PREFIX, dir=repo.state_dir))
+    driver = attempt / "driver"
+    with driver.open("wb") as fh:
+        fh.write(pinned)
+        os.fchmod(fh.fileno(), 0o500)
+        fh.flush()
+        os.fsync(fh.fileno())
+    (attempt / "state").mkdir(mode=0o700)
+    # Record recovery intent before main can advance, including the gap before ffed.
+    journal(
+        repo, "graceful_prepared", durable=True, candidate=candidate,
+        graceful={"attempt": attempt.name, "digest": hashlib.sha256(pinned).hexdigest()},
+    )
+    return attempt
+
+
+@contextlib.contextmanager
+def graceful_lease(attempt: Path):
+    # The exec'ed driver holds this same open file description until it exits.
+    # Closing (not LOCK_UN) leaves its lease in force if the coordinator exits.
+    fd = os.open(attempt / "lease", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise GracefulDriverRunning(
+                "the previous graceful driver is still running; retry recovery after it exits"
+            ) from exc
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def run_graceful_driver(
+    repo: Repo, attempt: Path, mode: str, target: str, log_path: Path, lease: int
+) -> CommandOutcome:
+    stage = f"graceful {mode}"
+    release_remaining(stage)
+    if mode == "deploy":
+        # From here on recovery must assume forward may have touched prod.
+        journal(repo, "graceful_deploying", durable=True, candidate=target)
+    try:
+        with log_path.open("ab") as log:
+            proc = subprocess.Popen(
+                [str(attempt / "driver"), mode, target, str(attempt / "state")],
+                cwd=repo.canonical,
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                pass_fds=(lease,),
+                start_new_session=True,
+            )
+            while True:
+                remaining = release_remaining(stage)
+                try:
+                    return CommandOutcome(proc.wait(timeout=None if remaining is None else min(0.1, remaining)))
+                except subprocess.TimeoutExpired:
+                    continue
+    except (ReleaseDeadlineExceeded, ReleaseCancelled, KeyboardInterrupt) as exc:
+        # Never signal this process or start compensating against a live driver.
+        raise GracefulDriverRunning(
+            f"coordinator stopped waiting during {stage}; recovery state preserved, driver not signalled"
+        ) from exc
+
+
+def finish_graceful(repo: Repo, attempt: Path, event: str, **fields) -> None:
+    journal(repo, event, durable=True, graceful_settled=True, **fields)
+    try:
+        shutil.rmtree(attempt)
+    except OSError as exc:
+        warn(f"cannot remove settled graceful state {attempt}: {exc}")
+
+
+def recover_graceful(
+    repo: Repo, inc: dict, log_path: Path, *, deploy_rc: int | None = None
+) -> str:
+    """Resume the recorded route, never probing or deploying via legacy commands."""
+    M, C = inc["pre_main"], inc["candidate"]
+    meta = inc["graceful"]
+    name = meta["attempt"]
+    if Path(name).name != name or not name.startswith(GRACEFUL_ATTEMPT_PREFIX):
+        die("invalid graceful transaction directory in journal", 2)
+    attempt = repo.state_dir / name
+    state = attempt / "state"
+    driver = attempt / "driver"
+    if (
+        attempt.is_symlink() or state.is_symlink() or not state.is_dir()
+        or driver.is_symlink() or not driver.is_file()
+        or not driver.stat().st_mode & stat.S_IXUSR
+        or hashlib.sha256(driver.read_bytes()).hexdigest() != meta["digest"]
+    ):
+        die("graceful transaction state or pinned executable is missing or changed; recovery stopped", 2)
+
+    with recovery_deadline(), graceful_lease(attempt) as lease:
+        main = repo.main_branch
+        local = rev(repo.canonical, main)
+        if (
+            local not in (M, C) or current_branch(repo.canonical) != main
+            or worktree_is_dirty(repo.canonical)
+        ):
+            die("graceful recovery requires a clean canonical checkout at its recorded main", 2)
+        has_origin = remote_exists(repo.canonical)
+        origin = exact_origin_main(repo) if has_origin else None
+        deployed = read_deployed(repo)
+        green = rev(repo.canonical, LAST_GREEN_REF)
+        if local == deployed == C and (origin == C or (not has_origin and green == C)):
+            set_last_green(repo, C)
+            finish_graceful(repo, attempt, "complete", merged=C, note="recovered_graceful_publish")
+            return "candidate_published"
+        if (has_origin and origin != M) or green not in (None, M):
+            die("graceful recovery found divergent release refs; recovery state preserved", 2)
+        if local == C:
+            with allow_main_updates(repo):
+                git(repo.canonical, "reset", "--hard", M)
+        sync_submodules(repo.canonical)
+        if "graceful_deploying" in inc["_phase_events"]:
+            outcome = run_graceful_driver(repo, attempt, "rollback", M, log_path, lease)
+            if outcome.returncode != 0:
+                raise GracefulTransactionError(f"graceful rollback failed (exit {outcome.returncode})")
+            write_deployed(repo, M)
+            set_last_green(repo, M)
+            write_pending_deploy(repo, None)
+        finish_graceful(
+            repo, attempt, "recovered_rollback" if deploy_rc is None else "deploy_failed",
+            candidate=C, pre_main=M, **({"rc": deploy_rc} if deploy_rc is not None else {}),
+        )
+        return "pre_release_restored"
+
+
+# --------------------------------------------------------------------------
 # preflight reconcile / recovery
 # --------------------------------------------------------------------------
-def preflight_base(repo: Repo, log_path: Path) -> None:
+def preflight_base(repo: Repo, log_path: Path, *, graceful_only: bool = False) -> bool:
     """Incomplete-gate recovery + canonical clean/on-main checks.
 
     The shared prefix of the full preflight and of `adopt` (which must skip
@@ -1164,9 +1346,16 @@ def preflight_base(repo: Repo, log_path: Path) -> None:
 
     # (a) recover from an incomplete gate
     inc = last_incomplete_gate(repo)
+    recovered_graceful = bool(inc and inc.get("graceful"))
     if inc:
-        with recovery_deadline():
-            recover_incomplete(repo, inc, log_path)
+        if graceful_only and not recovered_graceful:
+            if not inc.get("graceful_only"):
+                die("--graceful-only cannot recover an incomplete legacy release", 2)
+            # Interrupted before graceful_prepared: no canonical or live mutation.
+            journal(repo, "abandoned", note="graceful_not_prepared")
+        else:
+            with recovery_deadline():
+                recover_incomplete(repo, inc, log_path)
 
     # (b) canonical must be clean and on main
     if worktree_is_dirty(repo.canonical):
@@ -1177,16 +1366,21 @@ def preflight_base(repo: Repo, log_path: Path) -> None:
             2,
         )
     if current_branch(repo.canonical) != main:
+        if graceful_only:
+            die(f"--graceful-only requires the canonical checkout already on {main}", 2)
         git(repo.canonical, "checkout", main)
+    return recovered_graceful
 
 
-def preflight_reconcile(repo: Repo, log_path: Path) -> None:
+def preflight_reconcile(repo: Repo, log_path: Path, *, graceful_only: bool = False) -> bool:
     """Bring the repo to a known-good baseline before a gate run.
 
     Also used by `doctor --fix`. Handles crash recovery from the journal.
     """
     main = repo.main_branch
-    preflight_base(repo, log_path)
+    recovered_graceful = preflight_base(repo, log_path, graceful_only=graceful_only)
+    if recovered_graceful and not graceful_only:
+        return True
 
     last_green = rev(repo.canonical, LAST_GREEN_REF)
     main_sha = rev(repo.canonical, main)
@@ -1218,7 +1412,12 @@ def preflight_reconcile(repo: Repo, log_path: Path) -> None:
             "Investigate manually — compare the two SHAs and reconcile by hand.",
             2,
         )
-    if remote_exists(repo.canonical):
+    if graceful_only:
+        if read_pending_deploy(repo) or read_deployed(repo) not in (None, main_sha):
+            die("--graceful-only requires no pending or mismatched baseline deploy", 2)
+        if remote_exists(repo.canonical) and exact_origin_main(repo) != main_sha:
+            die(f"--graceful-only requires origin/{main} to match local {main}", 2)
+    elif remote_exists(repo.canonical):
         git(repo.canonical, "fetch", "origin", main, check=False)
         origin = rev(repo.canonical, f"origin/{main}")
         deployed = read_deployed(repo)
@@ -1252,10 +1451,19 @@ def preflight_reconcile(repo: Repo, log_path: Path) -> None:
 
     # (d) gate worktree
     ensure_gate_worktree(repo)
+    return recovered_graceful
 
 
 def recover_incomplete(repo: Repo, inc: dict, log_path: Path) -> None:
     """Deterministically recover from a crashed gate run."""
+    if inc.get("graceful"):
+        say("greenline: recovering incomplete graceful transaction...")
+        recover_graceful(repo, inc, log_path)
+        return
+    if inc.get("graceful_only"):
+        journal(repo, "abandoned", note="graceful_not_prepared")
+        return
+
     main = repo.main_branch
     M = inc.get("pre_main")
     C = inc.get("candidate")
@@ -1983,6 +2191,8 @@ def cmd_worktree(args) -> int:
 def cmd_submit(args) -> int:
     repo = load_repo(args.repo)
     main = repo.main_branch
+    graceful_only = args.graceful_only
+    attempt: Path | None = None
     advanced = False
     publish_attempted = False
     pre_main: str | None = None
@@ -2018,24 +2228,35 @@ def cmd_submit(args) -> int:
     with lock:
         try:
             lock.set_phase("preflight", branch)
-            preflight_reconcile(repo, log_path)
+            src = rev(repo.canonical, f"refs/heads/{branch}")
+            if not src:
+                die(f"branch {branch} does not exist")
+            if graceful_only:
+                graceful_driver_blob(repo.canonical, src)
+            recovered_graceful = preflight_reconcile(repo, log_path, graceful_only=graceful_only)
+            if recovered_graceful and not graceful_only:
+                say("Graceful recovery completed; no legacy release started. Resubmit with --graceful-only.")
+                return 2
 
             M = rev(repo.canonical, main)
             pre_main = M
-            src = rev(repo.canonical, branch)
-            journal(repo, "start", branch=branch, candidate_src_sha=src, pre_main=M)
+            journal(
+                repo, "start", branch=branch, candidate_src_sha=src, pre_main=M,
+                **({"graceful_only": True} if graceful_only else {}),
+            )
 
             gate = repo.gate_path
             # merge --squash
             lock.set_phase("merging", branch)
-            mp = git(gate, "merge", "--squash", branch, check=False)
+            mp = git(gate, "merge", "--squash", src, check=False)
             if mp.returncode != 0:
                 conflicts = git_out(gate, "diff", "--name-only", "--diff-filter=U")
                 git(gate, "merge", "--abort", check=False)
                 git(gate, "reset", "--hard", main)
                 git(gate, "clean", "-fd")
                 journal(repo, "fail", stage="merge", branch=branch, conflicts=conflicts)
-                flush_pending_deploy(repo, log_path, lock, branch)
+                if not graceful_only:
+                    flush_pending_deploy(repo, log_path, lock, branch)
                 say("MERGE CONFLICT — candidate does not apply on top of main.")
                 say("conflicting files:")
                 for f in conflicts.splitlines():
@@ -2055,7 +2276,7 @@ def cmd_submit(args) -> int:
 
             # build commit message
             subjects = git_out(
-                repo.canonical, "log", "--format=%s", f"{M}..{branch}"
+                repo.canonical, "log", "--format=%s", f"{M}..{src}"
             ).splitlines()
             tip_subject = subjects[0] if subjects else branch
             body = "\n".join(f"- {s}" for s in subjects)
@@ -2064,6 +2285,9 @@ def cmd_submit(args) -> int:
             C = rev(gate, "HEAD")
             candidate = C
             sync_submodules(gate)
+            pinned = graceful_driver_blob(gate, C) if graceful_only else None
+            if pinned is not None:
+                verify_graceful_driver(gate / GRACEFUL_DRIVER_RELPATH, pinned)
 
             # check
             lock.set_phase("checking", branch)
@@ -2109,6 +2333,11 @@ def cmd_submit(args) -> int:
                 say(log_tail(log_path, 50))
                 return 1
             journal(repo, "checked", candidate=C)
+            if pinned is not None:
+                if rev(gate, "HEAD") != C:
+                    die("gate check moved the tested candidate HEAD; graceful submit stopped", 2)
+                verify_graceful_driver(gate / GRACEFUL_DRIVER_RELPATH, pinned)
+                attempt = prepare_graceful(repo, C, pinned)
 
             # advance canonical main
             lock.set_phase("advancing", branch)
@@ -2123,7 +2352,13 @@ def cmd_submit(args) -> int:
             lock.set_phase("deploying", branch)
             say("deploying to prod ...")
             deploy_started = time.monotonic()
-            deploy_outcome = deploy_now(repo, C, log_path)
+            if attempt is None:
+                deploy_outcome = deploy_now(repo, C, log_path)
+            else:
+                with graceful_lease(attempt) as lease:
+                    deploy_outcome = run_graceful_driver(repo, attempt, "deploy", C, log_path, lease)
+                if deploy_outcome.returncode == 0:
+                    write_deployed(repo, C)
             deploy_seconds = time.monotonic() - deploy_started
             if deploy_outcome.returncode != 0 or deploy_outcome.timed_out:
                 if deploy_outcome.timed_out:
@@ -2134,7 +2369,13 @@ def cmd_submit(args) -> int:
                     f"{M[:8]}"
                 )
                 try:
-                    rollback_submit(repo, M, log_path)
+                    if attempt is None:
+                        rollback_submit(repo, M, log_path)
+                    else:
+                        recover_graceful(
+                            repo, last_incomplete_gate(repo), log_path,
+                            deploy_rc=deploy_outcome.returncode,
+                        )
                 except Exception as rollback_exc:  # noqa: BLE001
                     journal(
                         repo,
@@ -2148,18 +2389,19 @@ def cmd_submit(args) -> int:
                     say(f"log: {log_path}")
                     return 1
                 advanced = False
-                journal(
-                    repo,
-                    "deploy_failed",
-                    candidate=C,
-                    pre_main=M,
-                    rc=deploy_outcome.returncode,
-                    **(
-                        {"reason": deploy_outcome.timeout_reason}
-                        if deploy_outcome.timed_out
-                        else {}
-                    ),
-                )
+                if attempt is None:
+                    journal(
+                        repo,
+                        "deploy_failed",
+                        candidate=C,
+                        pre_main=M,
+                        rc=deploy_outcome.returncode,
+                        **(
+                            {"reason": deploy_outcome.timeout_reason}
+                            if deploy_outcome.timed_out
+                            else {}
+                        ),
+                    )
                 say(f"prod restored to {M[:8]}. branch preserved.")
                 say(f"log: {log_path}")
                 say(log_tail(log_path, 50))
@@ -2182,7 +2424,10 @@ def cmd_submit(args) -> int:
                 "publish_seconds": round(publish_seconds, 6),
                 "total_seconds": round(total_seconds, 6),
             }
-            journal(repo, "complete", merged=C, branch=branch, **timings)
+            if attempt is None:
+                journal(repo, "complete", merged=C, branch=branch, **timings)
+            else:
+                finish_graceful(repo, attempt, "complete", merged=C, branch=branch, **timings)
             if total_seconds > RELEASE_TARGET_SECONDS:
                 lock.require_optimization_after_release(
                     branch, C, total_seconds, log_path
@@ -2204,10 +2449,21 @@ def cmd_submit(args) -> int:
             say(f"  log      : {log_path}")
             say(f"  next     : greenline done   # from {their_wt or 'your worktree'}")
             return 0
+        except GracefulDriverRunning as exc:
+            say(f"RELEASE FAILED — {exc}. log: {log_path}")
+            return 1
         except (ReleaseDeadlineExceeded, ReleaseCancelled) as exc:
             rollback_error = None
             reconciliation = None
-            if advanced and pre_main:
+            if graceful_only:
+                with recovery_deadline():
+                    inc = last_incomplete_gate(repo)
+                    if inc and inc.get("graceful"):
+                        try:
+                            reconciliation = recover_graceful(repo, inc, log_path)
+                        except (Exception, SystemExit) as rollback_exc:
+                            rollback_error = repr(rollback_exc)
+            elif advanced and pre_main:
                 try:
                     if publish_attempted and candidate:
                         reconciliation = reconcile_submit_publish_deadline(
@@ -2280,7 +2536,9 @@ def cmd_adopt(args) -> int:
             lock.set_phase("preflight", "adopt")
             # incomplete-gate recovery + clean/on-main checks; NO drift check —
             # drift is the point of adopt.
-            preflight_base(repo, log_path)
+            if preflight_base(repo, log_path):
+                say("Graceful recovery completed; no legacy adopt started.")
+                return 2
 
             tip = rev(repo.canonical, main)
             last_green = rev(repo.canonical, LAST_GREEN_REF)
@@ -2596,14 +2854,18 @@ def cmd_done(args) -> int:
 def cmd_deploy_pending(args) -> int:
     """Recover a legacy or interrupted main lacking deploy attestation."""
     repo = load_repo(args.repo)
-    pending = read_pending_deploy(repo)
-    if not pending:
-        say("nothing pending — deployed matches main")
-        return 0
     log_path = repo.logs_dir / f"{utcnow()}-deploy-pending.log"
     lock = GateLock(repo)
     with lock:
         try:
+            inc = last_incomplete_gate(repo)
+            if inc and inc.get("graceful"):
+                recover_graceful(repo, inc, log_path)
+                return 0
+            pending = read_pending_deploy(repo)
+            if not pending:
+                say("nothing pending — deployed matches main")
+                return 0
             lock.set_phase("deploying-pending", "(deferred)")
             tip = rev(repo.canonical, repo.main_branch)
             say(f"deploying deferred main {short(repo.canonical, tip)} ...")
@@ -2820,6 +3082,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("submit", help="submit a branch through the serialized gate")
     sp.add_argument("branch", nargs="?")
+    sp.add_argument(
+        "--graceful-only", action="store_true",
+        help="use the candidate's committed graceful driver for both deploy and rollback; never fall back",
+    )
     add_repo(sp)
     sp.set_defaults(func=cmd_submit)
 
@@ -2888,6 +3154,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     except ReleaseCancelled as exc:
         warn(f"RELEASE CANCELLED — {exc}")
+        return 1
+    except GracefulTransactionError as exc:
+        warn(f"GRACEFUL TRANSACTION INCOMPLETE — {exc}; recovery state preserved")
         return 1
     except GitError as e:
         die(str(e), 2)
